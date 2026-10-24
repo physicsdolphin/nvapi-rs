@@ -40,6 +40,11 @@ pub struct Gpu {
     vfp_info: OnceLock<VfpInfo>,
 }
 
+/// Restores the `nvapi::hi::AdcDevices` name the nvoc vbios-parser-enhanced
+/// gitlink (8fc2fbe) was recorded against; that commit was never pushed, so
+/// this alias keeps the public surface stable.
+pub type AdcDevices = crate::clock::AdcDevicesInfo;
+
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, Hash)]
 pub struct GpuInfo {
@@ -220,6 +225,14 @@ impl Gpu {
 
     pub fn inner(&self) -> &PhysicalGpu {
         &self.gpu
+    }
+
+    /// ADC device directory — hi pass-through of [`PhysicalGpu::adc_devices_info`]
+    /// (`ClockAdcDevicesGetInfo` 0x68789E2A); live channel readings come from
+    /// [`PhysicalGpu::adc_devices_status`] (0x43D9B26A). Name kept for the
+    /// nvoc gitlink surface (see [`AdcDevices`]).
+    pub fn adc_devices(&self) -> crate::Result<Option<AdcDevices>> {
+        self.gpu.adc_devices_info()
     }
 
     pub fn id(&self) -> usize {
