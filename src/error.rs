@@ -57,6 +57,19 @@ pub fn status_result(nvid: sys::Api, status: sys::NvAPI_Status) -> Result<(), Nv
 pub enum Error {
     Nvapi(NvapiError),
     ArgumentRange(ArgumentRangeError),
+    /// A write path whose SET call succeeded (driver status 0) but whose
+    /// mandatory readback verification found a different value retained —
+    /// the driver accepted the write and silently dropped it. Carries the
+    /// requested vs retained raw values so callers see the real mismatch
+    /// instead of an out-of-range placeholder.
+    RetainMismatch {
+        what: &'static str,
+        wrote: i32,
+        retained: i32,
+    },
+    /// A readback verification could not locate the expected entry/field in
+    /// the driver's response at all.
+    VerifyMissing(&'static str),
 }
 
 impl Error {
@@ -144,10 +157,13 @@ impl From<ArgumentRangeError> for Error {
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        Some(match self {
-            Error::Nvapi(e) => e as _,
-            Error::ArgumentRange(e) => e as _,
-        })
+        match self {
+            Error::Nvapi(e) => Some(e as _),
+            Error::ArgumentRange(e) => Some(e as _),
+            // self-descriptive: the requested/retained values are already in
+            // the Display output, no underlying status to chain
+            Error::RetainMismatch { .. } | Error::VerifyMissing(_) => None,
+        }
     }
 }
 
@@ -156,6 +172,37 @@ impl fmt::Display for Error {
         match self {
             Error::Nvapi(e) => fmt::Display::fmt(e, f),
             Error::ArgumentRange(e) => fmt::Display::fmt(e, f),
+            Error::RetainMismatch {
+                what,
+                wrote,
+                retained,
+            } => write!(
+                f,
+                "driver did not retain requested value ({what}): wrote {wrote}, read back {retained}"
+            ),
+            Error::VerifyMissing(what) => write!(f, "verification readback missing {what}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retain_mismatch_display_carries_values() {
+        let err = Error::RetainMismatch {
+            what: "volt-rail control payload slot",
+            wrote: 2000,
+            retained: 0,
+        };
+        assert_eq!(
+            err.to_string(),
+            "driver did not retain requested value (volt-rail control payload slot): wrote 2000, read back 0"
+        );
+        assert_eq!(
+            Error::VerifyMissing("control entry").to_string(),
+            "verification readback missing control entry"
+        );
     }
 }

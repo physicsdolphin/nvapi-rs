@@ -2074,7 +2074,9 @@ impl PhysicalGpu {
         value_uV: i32,
     ) -> crate::Result<i32> {
         if slot >= power::undocumented::ctrl_entry::VALUES_LEN {
-            return Err(crate::Error::ArgumentRange(Default::default()));
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                i64::from(slot as u32),
+            )));
         }
         trace!("gpu.set_volt_rail_slot({rail_bit}, {slot}, {value_uV})");
         use crate::sys::api::{
@@ -2102,7 +2104,7 @@ impl PhysicalGpu {
         let dst = control
             .rest
             .get_mut(off..off + 4)
-            .ok_or(crate::Error::ArgumentRange(Default::default()))?;
+            .ok_or_else(|| crate::Error::ArgumentRange(sys::ArgumentRangeError::new(off as i64)))?;
         dst.copy_from_slice(&value_uV.to_le_bytes());
 
         let st =
@@ -2124,10 +2126,16 @@ impl PhysicalGpu {
             .entries()
             .find(|(bit, _, _)| *bit == rail_bit)
             .map(|(_, _, values)| values[slot])
-            .ok_or(crate::Error::ArgumentRange(Default::default()))?;
+            .ok_or(crate::Error::VerifyMissing(
+                "volt-rail control entry in verification readback",
+            ))?;
         if retained != value_uV {
             // "Driver did not retain requested value" (melonVolt's wording)
-            return Err(crate::Error::ArgumentRange(Default::default()));
+            return Err(crate::Error::RetainMismatch {
+                what: "volt-rail control payload slot",
+                wrote: value_uV,
+                retained,
+            });
         }
         Ok(retained)
     }
@@ -2135,7 +2143,9 @@ impl PhysicalGpu {
     /// Dense-entry index of `rail_bit` within `mask` (set bits, ascending).
     fn dense_index_for(mask: u32, rail_bit: u32) -> crate::Result<usize> {
         if rail_bit >= 32 || mask & (1 << rail_bit) == 0 {
-            return Err(crate::Error::ArgumentRange(Default::default()));
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                i64::from(rail_bit),
+            )));
         }
         Ok((0..rail_bit).filter(|b| mask & (1 << b) != 0).count())
     }
@@ -2491,8 +2501,9 @@ impl PhysicalGpu {
             };
             m.set_count(domains.len() as u8);
             for (i, &d) in domains.iter().enumerate() {
-                m.set_entry(i, d, 0, 0)
-                    .ok_or_else(|| crate::Error::ArgumentRange(Default::default()))?;
+                m.set_entry(i, d, 0, 0).ok_or_else(|| {
+                    crate::Error::ArgumentRange(sys::ArgumentRangeError::new(i as i64))
+                })?;
             }
             let st =
                 unsafe { NvAPI_GPU_ClockCounterMeasureAvgFreq(gpu, ptr::from_mut(&mut m).cast()) };
@@ -2619,11 +2630,15 @@ impl PhysicalGpu {
             )));
         }
         if slot >= 8 {
-            return Err(crate::Error::ArgumentRange(Default::default()));
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                i64::from(slot),
+            )));
         }
         let real_mask = probe.controllable_mask();
         if domain_bit >= 32 || real_mask & (1 << domain_bit) == 0 {
-            return Err(crate::Error::ArgumentRange(Default::default()));
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                i64::from(domain_bit),
+            )));
         }
         // Refuse record types the V2 protocol does not marshal (e.g. 0x02 —
         // Disp bit 6): SET_CONTROL silently drops them and the readback can
@@ -2650,7 +2665,9 @@ impl PhysicalGpu {
         let mut modified = snapshot;
         modified
             .set_value(domain_bit, slot as usize, offset_kHz)
-            .ok_or_else(|| crate::Error::ArgumentRange(Default::default()))?;
+            .ok_or(crate::Error::VerifyMissing(
+                "clk-domain control value window in V2 layout",
+            ))?;
 
         // Step 5: SET_CONTROL (full block, real controllable mask).
         let st =
