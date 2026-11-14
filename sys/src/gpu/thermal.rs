@@ -593,7 +593,11 @@ pub mod undocumented {
             /// 0 = channel follows the real sensor. The mVolt+ "Thermal
             /// inputs" panel writes this field.
             pub sim_temp_q8: i32,
-            pub rsvd1: Padding<[u8; 96]>,
+            pub rsvd1: Padding<[u8; 68]>,
+            /// Per-input "applied" flag (live-diffed at +80: 1 for the inputs
+            /// an mVolt apply covers). Semantics beyond 0/1 unknown.
+            pub applied: u32,
+            pub rsvd2: Padding<[u8; 24]>,
         }
     }
 
@@ -614,6 +618,8 @@ pub mod undocumented {
 
     /// Max entries in the CONTROL params (96 × 108 B + 76 B header = 10444).
     pub const NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX: usize = 96;
+    /// Total CONTROL params size in bytes.
+    pub const NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_SIZE: usize = 10444;
 
     impl NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3 {
         /// Current sim override (Q8) for a channel, if populated.
@@ -632,6 +638,25 @@ pub mod undocumented {
         pub fn set_sim_temp_q8(&mut self, channel: usize, q8: i32) {
             self.channel_mask |= 1u32 << channel;
             self.entry[channel].sim_temp_q8 = q8;
+        }
+
+        /// Whole-buffer mutable view (for the empirical enable-flag recipe).
+        pub fn raw_mut(&mut self) -> &mut [u8] {
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    self as *mut Self as *mut u8,
+                    NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_SIZE,
+                )
+            }
+        }
+
+        /// Per-input "applied" flag at entry_k+80 (live-diffed: +0xBC/+0x194/
+        /// +0x200 = 1 for inputs 1/3/4 in the mVolt LN2 state). Index here =
+        /// driver channel number.
+        pub fn set_applied_flag(&mut self, channel: usize) {
+            if channel < NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX {
+                self.entry[channel].applied = 1;
+            }
         }
     }
 

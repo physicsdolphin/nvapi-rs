@@ -7437,6 +7437,14 @@ impl PhysicalGpu {
         let mut data = self.thermal_channel_control(mask).map_err(crate::Error::from)?;
         // Patch the sim override for this channel (Q8).
         data.set_sim_temp_q8(channel, (celsius * 256.0) as i32);
+        // Apply the mVolt+-empirical enable recipe (live-diffed 5060 Ti /
+        // 621.24, T7): three live-enable bytes (0x2F/0x65/0x80) flip 0->1 on
+        // every apply, and the per-input applied flag sits at entry_k+80.
+        // Without these the SET is accepted-but-ignored (T6 first attempt).
+        data.raw_mut()[0x2F] = 1;
+        data.raw_mut()[0x65] = 1;
+        data.raw_mut()[0x80] = 1;
+        data.set_applied_flag(channel);
         // SET: apply the patched buffer.
         unsafe {
             let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, &mut data);
