@@ -1771,6 +1771,15 @@ impl PhysicalGpu {
         unsafe { nvcall!(NvAPI_GPU_ClientVoltRailsGetStatus@get(self.0) => raw) }
     }
 
+    /// Legacy "volt boost" percent (ClientVoltRails control 0x9DF23CA1, 40B
+    /// / 0x10028). SEMANTICS (2026-11-14, 5060 Ti / 621.01 live A/B —
+    /// previously unknown): maps the rail TARGET wall along
+    /// `ceiling = StandardMax + (BoostMax − StandardMax) · percent/100`;
+    /// 100 % pinned the target wall at the VBIOS wall (1020 mV) and current
+    /// followed. The driver echoes the percent in the melonVolt 2760B
+    /// CONTROL object at buffer offset +8. This is the CONSUMED voltage
+    /// lane on Blackwell/621 — the melonVolt payload-offset writes are
+    /// accepted-but-dropped there (see `set_volt_rail_slot`).
     pub fn core_voltage_boost(
         &self,
     ) -> crate::Result<
@@ -1781,6 +1790,11 @@ impl PhysicalGpu {
         unsafe { nvcall!(NvAPI_GPU_ClientVoltRailsGetControl@get(self.0) => raw) }
     }
 
+    /// Set the legacy volt boost percent — see [`Self::core_voltage_boost`]
+    /// for the wall-mapping semantics (`StandardMax + (BoostMax −
+    /// StandardMax) · percent/100`). The only live NVAPI wall-raising lane
+    /// on RTX 5060 Ti / 621.01 (mVolt+ "Write Voltage Boost percentage"
+    /// uses the same 40B/0x10028 shape).
     pub fn set_core_voltage_boost(&self, value: Percentage) -> crate::NvapiResult<()> {
         trace!("gpu.set_core_voltage_boost({:?})", value);
         let data = power::undocumented::NV_GPU_CLIENT_VOLT_RAILS_CONTROL {
@@ -2066,6 +2080,18 @@ impl PhysicalGpu {
     /// write on 4060 Laptop / 610 took the driver down (2026-10-06 field
     /// report, reproduced on both slots) — they are live policy fields on
     /// that generation, not padding. Never write them outside a lab.
+    ///
+    /// ⚠️ **Blackwell / 621.01 field verdict (2026-11-14, RTX 5060 Ti,
+    /// probe `tests/volt_rails_blackwell_probe.rs` arms C/D/F): EVERY
+    /// payload-slot write here is accepted (SET status 0) but retained
+    /// NOWHERE — full-buffer dword diff stays empty, mirror-init doesn't
+    /// help, both V1 and V2 stamps behave the same. The consumed channel on
+    /// that generation is the legacy boost percent
+    /// ([`Self::set_core_voltage_boost`], echoed back at control buffer
+    /// offset +8) whose mapping is
+    /// `ceiling = StandardMax + (BoostMax − StandardMax) · percent/100`.
+    /// mVolt+ 0.50.13 shares the failure mode ("driver did not retain the
+    /// requested rail offsets") and pivots to a BIOS-override lane.
     #[allow(non_snake_case)]
     pub fn set_volt_rail_slot(
         &self,

@@ -27,6 +27,25 @@ pub mod undocumented {
             /// AB 19412 `ClientVoltageRail_SetControl` decode: 40B block,
             /// version 0x10028, control value written to the low BYTE of this
             /// dword (@+4); GetControl reads the same byte back.
+            ///
+            /// SEMANTICS (2026-11-14, RTX 5060 Ti / 621.01 live A/B — was
+            /// "unknown meaning" before): the percent maps the rail's TARGET
+            /// voltage wall along
+            ///
+            /// ```text
+            /// ceiling = StandardMax + (BoostMax − StandardMax) · percent/100
+            /// ```
+            ///
+            /// (xOCD rail-window mapping; the driver clamps the effective
+            /// wall to min(target, vbios_wall, vrm_max_wall) afterwards).
+            /// Live: boost 100 % pinned the target wall at the VBIOS wall
+            /// (1020 mV) and current followed; the percent is echoed back in
+            /// the melonVolt 2760B CONTROL object at buffer offset +8 (dense
+            /// head, NOT the six payload dwords — payload writes are
+            /// accepted-but-dropped on Blackwell/621, probe
+            /// `tests/volt_rails_blackwell_probe.rs` arms C/D/F). mVolt+
+            /// 0.50.13 `sub_1402085C0` "Write Voltage Boost percentage"
+            /// drives this same 40B/0x10028 shape.
             pub percent: u32,
             pub unknown: Padding<[u32; 8]>,
         }
