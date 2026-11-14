@@ -1083,6 +1083,87 @@ fn vfe_v2_tier_probe() {
             );
         }
     }
+    // ============ 第九轮(2026-11-15,mVolt apply 流全 RE 后)============
+    // RE 判决(mVolt 0.50.13 sub_14028C6F0/B700/9BE0):
+    // ①V2 VarControl 记录几何与 round-4 完全一致(float* 索引 40*v+27/28/37/38
+    //   = 字节 160*v+108/112/148/152,掩码 @4+v/8)——我们 SET 的就是它;
+    // ②mVolt GET 带 32B 身份@4(对象+184),SET=身份版 GET 响应原样回传;
+    // ③var 索引来自运行时表(对象+28 步进20×8 字节),由验证流锚定;
+    // ④VarGetInfo 真结构 = 255 条 × 11200B @296(296+255*11200=2856296 整);
+    //   电压 offset var 签名 = type==13 && byte[+1620]==7 && byte[+1621]==8,
+    //   +260 起 336B = per-var 特征区;EquControl @76·equ+1092 的 +4/+6 u16 =
+    //   var 关联对。
+    // 本臂:VarInfo 11200 步进全表扫描(GET-only)——按签名定 8 个 offset var。
+    {
+        println!("=== [V9-1] Var GetInfo 11200-stride record scan (offset-var signature) ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeVarGetInfo;
+        let size = 2856296usize;
+        let mut b = vec![0u8; size];
+        b[0..4].copy_from_slice(&3118440u32.to_le_bytes());
+        let st = unsafe { NvAPI_GPU_PerfVfeVarGetInfo(handle, b.as_mut_ptr().cast()) } as i32;
+        println!("GET status={st}");
+        let mut hits = Vec::new();
+        for k in 0..255usize {
+            let base = 296 + 11200 * k;
+            if base + 11200 > size {
+                break;
+            }
+            let t = u32::from_le_bytes(b[base..base + 4].try_into().unwrap());
+            let b1620 = b[base + 1620];
+            let b1621 = b[base + 1621];
+            if t == 0 && b1620 == 0 && b1621 == 0 {
+                continue;
+            }
+            let sig = t == 13 && b1620 == 7 && b1621 == 8;
+            if sig {
+                hits.push(k);
+            }
+            // 打签名命中 + 少量非零样例(避免刷屏:只打 sig 命中和前 8 个其他)
+            if sig || hits.len() + k < 40 {
+                let mut fields = Vec::new();
+                for (i, w) in b[base..base + 276].chunks_exact(4).enumerate() {
+                    let v = u32::from_le_bytes(w.try_into().unwrap());
+                    if v != 0 {
+                        fields.push(format!("+{:03X}:{v:#x}", i * 4));
+                    }
+                }
+                println!(
+                    "  rec{k}@{base}: type={t} b1620={b1620} b1621={b1621} {}{}",
+                    if sig { "<— OFFSET-VAR SIG" } else { "" },
+                    if fields.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" head=[{}]", fields.join(" "))
+                    }
+                );
+            }
+        }
+        println!("offset-var signature hits: {hits:?}");
+        // Equ 层 var 关联对:@76·equ+1092 的 +4/+6 u16(前 24 条)
+        println!("  --- Equ var-link pairs (@76*equ+1092, first 24 nonzero) ---");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeEquGetControl;
+        let mut eb = vec![0u8; 1410116];
+        eb[0..4].copy_from_slice(&1410116u32.to_le_bytes());
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, eb.as_mut_ptr().cast()) };
+        let mut printed = 0usize;
+        for e in 0..0x2000usize {
+            let base = 1092 + 76 * e;
+            if base + 12 > eb.len() {
+                break;
+            }
+            let t = u32::from_le_bytes(eb[base..base + 4].try_into().unwrap());
+            if t == 0 {
+                continue;
+            }
+            let l1 = u16::from_le_bytes(eb[base + 4..base + 6].try_into().unwrap());
+            let l2 = u16::from_le_bytes(eb[base + 6..base + 8].try_into().unwrap());
+            println!("  equ{e}@{base}: type={t} link1={l1} link2={l2}");
+            printed += 1;
+            if printed >= 24 {
+                break;
+            }
+        }
+    }
     let _ = ptr::null_mut::<u8>();
     let _ = ptr::null_mut::<u8>();
 }
