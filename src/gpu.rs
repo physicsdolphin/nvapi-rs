@@ -7374,6 +7374,111 @@ impl PhysicalGpu {
         unsafe { nvcall!(NvAPI_GPU_ThermChannelGetStatus@get{data}(self.0) => raw) }
     }
 
+    /// Thermal-channel CONTROL state (undocumented `NvAPI_GPU_ThermChannelGetControl`,
+    /// 0xa933ce98; 10444 B, version (3<<16)|10444). Entry index = driver channel
+    /// number; `entry[ch].sim_temp_q8` is the per-channel temperature-sim
+    /// override (celsius*256, 0 = follow the real sensor) that the mVolt+
+    /// "Thermal inputs" lane writes. `channel_mask` comes from
+    /// [`Self::thermal_channel_info`] and must be a subset of the populated
+    /// channels (unpopulated bits are rejected).
+    ///
+    /// Live-verified: 5060 Ti / 621.24 (mVolt overlay consumed kernel-side)
+    /// and 2070 / 621.01.
+    pub fn thermal_channel_control(
+        &self,
+        channel_mask: u32,
+    ) -> crate::Result<thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL> {
+        trace!("gpu.thermal_channel_control(0x{:x})", channel_mask);
+        let mut data = thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3 {
+            version: NvVersion::new(
+                size_of::<thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3>(),
+                3,
+            ),
+            ..Default::default()
+        };
+        data.channel_mask = channel_mask;
+        unsafe {
+            let st = sys::api::NvAPI_GPU_ThermChannelGetControl(self.0, &mut data);
+            crate::status_result(sys::Api::NvAPI_GPU_ThermChannelGetControl, st)?;
+        }
+        Ok(data)
+    }
+
+    /// Apply one channel's temperature-sim override (the read half is primed
+    /// from live state so opaque fields survive). `celsius` is the simulated
+    /// reading for `channel`; pass the current real temp (or 0.0 to clear the
+    /// override and follow the real sensor).
+    ///
+    /// Uses the PRIVATE ThermChannel RMW pair (GET 0xa933ce98 +
+    /// SET 0x8df19fa2, 10444 B version-3 control). **This lane WORKS on
+    /// RTX 5060 Ti / 621.24** — the same driver where the voltage VFE
+    /// override lane is retain-but-never-consumed — making it the first
+    /// confirmed writable thermal surface on Blackwell+621.
+    ///
+    /// # Safety contract
+    /// NDA write path. The caller is responsible for restoring the previous
+    /// sim value (capture with [`Self::thermal_channel_control`] before
+    /// patching); sim temps alter DVFS/thermal behavior (the mVolt+ "LN2"
+    /// workflow exists because a cold-reported GPU boosts harder).
+    pub fn set_thermal_channel_sim_temp(
+        &self,
+        channel: usize,
+        celsius: f32,
+    ) -> crate::Result<()> {
+        trace!("gpu.set_thermal_channel_sim_temp(ch{channel}, {celsius} C)");
+        let info = self.thermal_channel_info().map_err(crate::Error::from)?;
+        let mask = info.channel_mask;
+        if mask & (1u32 << channel) == 0 {
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                channel as i64,
+            )));
+        }
+        // GET-prime: live control state (opaque fields preserved).
+        let mut data = self.thermal_channel_control(mask).map_err(crate::Error::from)?;
+        // Patch the sim override for this channel (Q8).
+        data.set_sim_temp_q8(channel, (celsius * 256.0) as i32);
+        // SET: apply the patched buffer.
+        unsafe {
+            let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, &mut data);
+            crate::status_result(sys::Api::NvAPI_GPU_ThermChannelSetControl, st)?;
+        }
+        Ok(())
+    }
+
+    /// Apply a full control buffer as-is (RMW discipline: prime with
+    /// [`Self::thermal_channel_control`], patch, then apply). See
+    /// [`Self::set_thermal_channel_sim_temp`] for the safety contract.
+    pub fn set_thermal_channel_control(
+        &self,
+        data: &mut thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL,
+    ) -> crate::Result<()> {
+        unsafe {
+            let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, data);
+            crate::status_result(sys::Api::NvAPI_GPU_ThermChannelSetControl, st)?;
+        }
+        Ok(())
+    }
+
+    /// Restore every channel's sim override to "follow the real sensor"
+    /// (sim_temp_q8 = 0) for all channels in `channel_mask`. Use after
+    /// [`Self::set_thermal_channel_sim_temp`] experiments.
+    pub fn clear_thermal_channel_sim_temps(&self, channel_mask: u32) -> crate::Result<()> {
+        trace!("gpu.clear_thermal_channel_sim_temps(0x{channel_mask:x})");
+        let mut data = self
+            .thermal_channel_control(channel_mask)
+            .map_err(crate::Error::from)?;
+        for ch in 0..thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX {
+            if channel_mask & (1u32 << ch) != 0 {
+                data.entry[ch].sim_temp_q8 = 0;
+            }
+        }
+        unsafe {
+            let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, &mut data);
+            crate::status_result(sys::Api::NvAPI_GPU_ThermChannelSetControl, st)?;
+        }
+        Ok(())
+    }
+
     pub fn thermal_limit_info(
         &self,
     ) -> crate::Result<

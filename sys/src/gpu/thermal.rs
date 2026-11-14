@@ -555,19 +555,106 @@ pub mod undocumented {
     // pointers until the struct lands.
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Thermal Channel CONTROL layout — RE'd 2026-11-15 from the mVolt+
+    // 0.50.13 call site (sub_1400120F0 @ 0x1400137FC) and live-verified on
+    // RTX 5060 Ti / 621.24 (GetControl st=0; Q8 sim values match the UI):
+    //
+    //   fn(handle, buf, len=0x28CC=10444)   // 3 args, len is REQUIRED
+    //   buf+0x00  version = (3<<16)|0x28CC = 0x328CC
+    //   buf+0x04  u32 (observed 2)
+    //   buf+0x08  channel_mask (must be a subset of GetInfo's mask;
+    //             bits for unpopulated channels → NVAPI error)
+    //   buf+0x0C  reserved (64 B)
+    //   buf+0x4C  entry[channel] × 96, 108 B each — index = driver channel:
+    //       +0x00 ch_class u32   (matches GetInfo's per-channel ch_class)
+    //       +0x04 rsvd
+    //       +0x08 sim_temp_q8 i32  ← the temperature-sim override
+    //                               (celsius*256); 0 = follow real sensor
+    //       +0x0C rsvd (96 B)
+    //
+    // Live proof (5060 Ti / 621.24, mVolt overlay applied): entry[1]
+    // (GPU_AVG, GetInfo priChIdx) sim=1280=5.0 C matching the UI "GPU temp
+    // 5"; entry[4] sim=−5120=−20.0 C matching "Internal 4 −20";
+    // GetStatus channel[1] returned exactly 5.00 C.
+    //
+    // SET half (0x8df19fa2) = same buffer patched (RMW), verified live by
+    // mVolt's overlay persisting across its own polls.
+    // ------------------------------------------------------------------
+
+    /// Thermal-channel CONTROL entry (108 B). Index = driver channel number
+    /// (same numbering as GetInfo's channel[] / priChIdx).
+    nvstruct! {
+        pub struct NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_ENTRY_V3 {
+            /// Channel class — mirrors GetInfo's per-channel `ch_class`.
+            pub ch_class: u32,
+            pub rsvd0: Padding<[u8; 4]>,
+            /// Temperature-sim override for this channel, celsius*256 (Q8).
+            /// 0 = channel follows the real sensor. The mVolt+ "Thermal
+            /// inputs" panel writes this field.
+            pub sim_temp_q8: i32,
+            pub rsvd1: Padding<[u8; 96]>,
+        }
+    }
+
+    /// Thermal-channel control params (version 3). 10444 bytes
+    /// (76-byte header + 96 × 108-byte entries).
+    nvstruct! {
+        pub struct NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3 {
+            pub version: NvVersion,
+            pub rsvd0: u32,
+            /// Which channel entries the driver should process. MUST be a
+            /// subset of GetInfo's `channel_mask` — unpopulated bits are
+            /// rejected (NVAPI error).
+            pub channel_mask: u32,
+            pub rsvd1: Padding<[u8; 64]>,
+            pub entry: Array<[NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_ENTRY_V3; 96]>,
+        }
+    }
+
+    /// Max entries in the CONTROL params (96 × 108 B + 76 B header = 10444).
+    pub const NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX: usize = 96;
+
+    impl NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3 {
+        /// Current sim override (Q8) for a channel, if populated.
+        pub fn sim_temp_q8(&self, channel: usize) -> Option<i32> {
+            if channel < NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX
+                && self.channel_mask & (1u32 << channel) != 0
+            {
+                Some(self.entry[channel].sim_temp_q8)
+            } else {
+                None
+            }
+        }
+
+        /// Set a channel's sim override (Q8) in this buffer. The channel must
+        /// be in `channel_mask`; call ThermChannelSetControl to apply.
+        pub fn set_sim_temp_q8(&mut self, channel: usize, q8: i32) {
+            self.channel_mask |= 1u32 << channel;
+            self.entry[channel].sim_temp_q8 = q8;
+        }
+    }
+
+    nvversion! { @=NV_GPU_THERMAL_THERM_CHANNEL_CONTROL NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3(3) = 10444 }
+
     nvapi! {
         /// Undocumented (NDA-private, ID 0xa933ce98). Thermal-channel control
-        /// state read (the read half of the offset RMW). Layout pending —
-        /// declared opaque; see `thermal_channel_probe.rs` for the stamp sweep.
-        pub unsafe fn NvAPI_GPU_ThermChannelGetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut core::ffi::c_void) -> NvAPI_Status;
+        /// state read (the read half of the temp-sim RMW). Buffer 10444 B,
+        /// version (3<<16)|10444. Live-verified 5060 Ti / 621.24 + 2070 / 621.01.
+        pub unsafe fn NvAPI_GPU_ThermChannelGetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut NV_GPU_THERMAL_THERM_CHANNEL_CONTROL) -> NvAPI_Status;
     }
 
     nvapi! {
         /// Undocumented (NDA-private, ID 0x8df19fa2). Thermal-channel control
-        /// write — per-channel temperature reading offsets (the mVolt+
-        /// "Thermal inputs" lane; live-confirmed on 5060 Ti / 621.24). Layout
-        /// pending — declared opaque; RMW from a GetControl prime.
-        pub unsafe fn NvAPI_GPU_ThermChannelSetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut core::ffi::c_void) -> NvAPI_Status;
+        /// write — applies `sim_temp_q8` overrides per channel (the mVolt+
+        /// "Thermal inputs" lane; live-confirmed working on 5060 Ti / 621.24
+        /// where the voltage VFE override lane is retain-but-never-consume).
+        ///
+        /// # Safety
+        /// NDA write path: RMW from a ThermChannelGetControl prime, keep all
+        /// opaque fields intact, restore the original buffer afterwards.
+        /// Changing sim temps alters DVFS/thermal behavior.
+        pub unsafe fn NvAPI_GPU_ThermChannelSetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut NV_GPU_THERMAL_THERM_CHANNEL_CONTROL) -> NvAPI_Status;
     }
 
     // ------------------------------------------------------------------

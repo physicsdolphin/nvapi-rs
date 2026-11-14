@@ -149,4 +149,53 @@ fn thermal_channel_probe() {
             println!("  +{off:04X}: i32={sv} = Q8 {:.3} C", sv as f64 / 256.0);
         }
     }
+    // ---- ⑥ 写臂（双重门控）：温度 sim RMW + 还原验证
+    if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
+        let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let celsius: f32 = std::env::var("NVOC_THERM_SIM_CELSIUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(45.0);
+        println!("=== [T6] WRITE: ch{ch} sim={celsius} C (RMW + restore-verify) ===");
+        let run = || -> Result<(), Box<dyn std::error::Error>> {
+            let mask = gpu.thermal_channel_info()?.channel_mask;
+            let orig = gpu.thermal_channel_control(mask)?;
+            let orig_q8 = orig.entry[ch].sim_temp_q8;
+            println!("  original entry[{ch}].sim_q8 = {orig_q8} ({:.2} C)", orig_q8 as f64 / 256.0);
+            gpu.set_thermal_channel_sim_temp(ch, celsius)?;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let st = gpu.thermal_channel_status(mask)?;
+            println!(
+                "  [mid] ch{ch} = {:.2} C {}",
+                st.get(ch).unwrap_or(f32::NAN),
+                if (st.get(ch).unwrap_or(f32::NAN) - celsius).abs() < 1.0 {
+                    "<— CONSUMED"
+                } else {
+                    "(no follow — check sim semantics)"
+                }
+            );
+            // 还原原值（Q8 精确）
+            let mut rst = gpu.thermal_channel_control(mask)?;
+            rst.entry[ch].sim_temp_q8 = orig_q8;
+            gpu.set_thermal_channel_control(&mut rst)?;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let back = gpu.thermal_channel_control(mask)?;
+            println!(
+                "  restore: entry[{ch}].sim_q8 = {} {}",
+                back.entry[ch].sim_temp_q8,
+                if back.entry[ch].sim_temp_q8 == orig_q8 { "<— restored" } else { "<— RESTORE FAILED" }
+            );
+            let st2 = gpu.thermal_channel_status(mask)?;
+            println!("  [after] ch{ch} = {:.2} C", st2.get(ch).unwrap_or(f32::NAN));
+            Ok(())
+        };
+        if let Err(e) = run() {
+            println!("  write arm error: {e}");
+        }
+    } else {
+        println!("write arm skipped — set NVOC_ALLOW_THERM_WRITE=1 (+NVOC_THERM_CHANNEL, NVOC_THERM_SIM_CELSIUS)");
+    }
 }
