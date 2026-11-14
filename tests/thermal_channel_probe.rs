@@ -193,13 +193,17 @@ fn thermal_channel_probe() {
             // control diff
             for (off, (a, b)) in c0.chunks_exact(4).zip(c.chunks_exact(4)).enumerate() {
                 if a != b {
-                    println!("  [it{it}] CTRL +{off:04X}: {a:#010x} -> {b:#010x}");
+                    let av = u32::from_le_bytes(a.try_into().unwrap());
+                    let bv = u32::from_le_bytes(b.try_into().unwrap());
+                    println!("  [it{it}] CTRL +{off:04X}: {av:#010x} -> {bv:#010x}");
                 }
             }
             // info diff
             for (off, (a, b)) in i0.chunks_exact(4).zip(i.chunks_exact(4)).enumerate() {
                 if a != b {
-                    println!("  [it{it}] INFO +{off:04X}: {a:#010x} -> {b:#010x}");
+                    let av = u32::from_le_bytes(a.try_into().unwrap());
+                    let bv = u32::from_le_bytes(b.try_into().unwrap());
+                    println!("  [it{it}] INFO +{off:04X}: {av:#010x} -> {bv:#010x}");
                 }
             }
             // status diff
