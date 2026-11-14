@@ -255,7 +255,11 @@ fn vfe_v2_tier_probe() {
     // (50 系 type=13 天然 SET-ready),只 patch min/max/applied/value → SET
     // → 读回+墙值三查(before/mid/after)→ 工厂记录 SET 回还原 → 复核。
     if std::env::var("NVOC_ALLOW_VFE_VAR0_WRITE").is_ok() {
-        println!("=== [WRITE] var0 (NVVDD REL offset) single-var SET + auto-restore ===");
+        let idx: usize = std::env::var("NVOC_VFE_VAR_INDEX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        println!("=== [WRITE] var{idx} single-var SET + auto-restore (gate NVOC_ALLOW_VFE_VAR0_WRITE) ===");
         use nvapi::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
         let value: f32 = std::env::var("NVOC_VFE_VAR0_VALUE_UV")
             .ok()
@@ -278,30 +282,30 @@ fn vfe_v2_tier_probe() {
             req
         };
         walls("before");
-        let factory = single_get(0);
-        let rec = 104usize;
+        let factory = single_get(idx);
+        let rec = 104 + 160 * idx;
         let f_type = u32::from_le_bytes(factory[rec..rec + 4].try_into().unwrap());
         println!(
-            "factory var0: type={f_type} min={} max={} applied={} value={}",
+            "factory var{idx}@{rec}: type={f_type} min={} max={} applied={} value={}",
             f32::from_le_bytes(factory[rec + 4..rec + 8].try_into().unwrap()),
             f32::from_le_bytes(factory[rec + 8..rec + 12].try_into().unwrap()),
             factory[rec + 44],
             f32::from_le_bytes(factory[rec + 48..rec + 52].try_into().unwrap()),
         );
 
-        // patch:单 bit0 掩码 + min/max/applied/value,其余字节原样
+        // patch:单 bit 掩码 + min/max/applied/value,其余字节原样
         let mut req = factory.clone();
         for x in req[4..36].iter_mut() {
             *x = 0;
         }
-        req[4] = 1;
+        req[4 + idx / 8] = 1 << (idx % 8);
         req[rec + 4..rec + 8].copy_from_slice(&value.min(0.0).to_le_bytes());
         req[rec + 8..rec + 12].copy_from_slice(&value.max(0.0).to_le_bytes());
         req[rec + 44] = 1;
         req[rec + 48..rec + 52].copy_from_slice(&value.to_le_bytes());
         let st_set = unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let back = single_get(0);
+        let back = single_get(idx);
         let rd_ap = back[rec + 44];
         let rd_v = f32::from_le_bytes(back[rec + 48..rec + 52].try_into().unwrap());
         println!(
@@ -317,7 +321,7 @@ fn vfe_v2_tier_probe() {
         // 还原:工厂记录原样 SET 回(applied=0/value=0)
         unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, factory.as_ptr().cast()) };
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let rst = single_get(0);
+        let rst = single_get(idx);
         let rs_ap = rst[rec + 44];
         let rs_v = f32::from_le_bytes(rst[rec + 48..rec + 52].try_into().unwrap());
         println!(
@@ -1139,12 +1143,25 @@ fn vfe_v2_tier_probe() {
             }
         }
         println!("offset-var signature hits: {hits:?}");
-        // Equ 层 var 关联对:@76·equ+1092 的 +4/+6 u16(前 24 条)
+        // Equ 层 var 关联对:@76·equ+1092 的 +4/+6 u16(前 24 条)——需身份
+        // (裸 GET 只有 stamp;9BE0 校验用 1024B 身份@4)
         println!("  --- Equ var-link pairs (@76*equ+1092, first 24 nonzero) ---");
         use nvapi::sys::api::NvAPI_GPU_PerfVfeEquGetControl;
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
         let mut eb = vec![0u8; 1410116];
         eb[0..4].copy_from_slice(&1410116u32.to_le_bytes());
+        eb[4..1028].copy_from_slice(&ident1024);
         unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, eb.as_mut_ptr().cast()) };
+        println!(
+            "  equ GET richness={}",
+            nonzero_dwords(&eb, usize::MAX).len()
+        );
         let mut printed = 0usize;
         for e in 0..0x2000usize {
             let base = 1092 + 76 * e;
