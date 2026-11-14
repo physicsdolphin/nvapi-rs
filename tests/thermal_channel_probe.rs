@@ -143,6 +143,66 @@ fn thermal_channel_probe() {
         println!("  (no variant accepted — control unreachable via 2-arg call on this driver)");
     }
 
+    // ---- ③b 3 参签名扫描（Marker 假说）：QueryInterface 拿裸指针，
+    // 按 (handle, buf, marker: usize) 调。MarkerFirst/Second 名字强烈暗示同一
+    // 接口按 marker 分调用模式。2 参错位时驱动返回 NOT_SUPPORTED 与全 -9 吻合。
+    println!("=== [T3b] 3-arg sweep (handle, buf, marker) x ids x masks x ver x sizes ===");
+    let qif = |id: u32| -> Option<unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status> {
+        match nvapi::sys::nvapi_QueryInterface(id) {
+            Ok(p) if !p.is_null() => Some(unsafe { core::mem::transmute(p) }),
+            _ => None,
+        }
+    };
+    let raw_ids = [(0xA933CE98u32, "GetControl-id"), (0x8DF19FA2, "SetControl-id")];
+    let mut accepted3: Vec<(u32, usize, u32, u32, usize)> = Vec::new(); // (id, size, ver, mask, marker)
+    for (id, id_name) in raw_ids {
+        let Some(f) = qif(id) else {
+            println!("  {id_name}: QueryInterface FAILED (id unresolved)");
+            continue;
+        };
+        println!("  {id_name}: QueryInterface OK");
+        for (mask, mask_name) in masks {
+            for ver in [2u32, 1u32] {
+                for size in sizes {
+                    for marker in [0usize, 1, 2] {
+                        let mut buf = vec![0u8; size];
+                        let v: u32 = (ver << 16) | (size as u32 & 0xFFFF);
+                        buf[0..4].copy_from_slice(&v.to_le_bytes());
+                        if size >= 8 {
+                            buf[4..8].copy_from_slice(&mask.to_le_bytes());
+                        }
+                        let st = unsafe { f(handle, buf.as_mut_ptr().cast(), marker) } as i32;
+                        if st == 0 {
+                            accepted3.push((id, size, ver, mask, marker));
+                            println!("  HIT {id_name} size={size} ver={ver} mask={mask_name} marker={marker}");
+                        } else if st != -9 {
+                            println!("  {id_name} size={size} ver={ver} mask={mask_name} marker={marker}: st={st}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("accepted3: {accepted3:?}");
+    if let Some(&(id, sz, ver, mask, marker)) = accepted3.first() {
+        println!("=== [T4b] 3-arg control dump (id={id:#x} size={sz} ver={ver} mask={mask:#x} marker={marker}) ===");
+        let f = qif(id).unwrap();
+        let mut buf = vec![0u8; sz];
+        let v: u32 = (ver << 16) | (sz as u32 & 0xFFFF);
+        buf[0..4].copy_from_slice(&v.to_le_bytes());
+        if sz >= 8 {
+            buf[4..8].copy_from_slice(&mask.to_le_bytes());
+        }
+        let st = unsafe { f(handle, buf.as_mut_ptr().cast(), marker) } as i32;
+        println!("status={st}");
+        let nz = nonzero_dwords(&buf, usize::MAX);
+        println!("nonzero dwords: {}", nz.len());
+        for (off, v) in nz.iter().take(80) {
+            let f32v = f32::from_le_bytes(v.to_le_bytes());
+            println!("  +{off:04X}: {v:#010x} (f32 {f32v})");
+        }
+    }
+
     // ---- ④ 被接受的最小形态全量 dump ----
     if let Some(&(id_idx, sz, ver, mask)) = accepted.first() {
         println!("=== [T4] control dump (id{} size={sz} ver={ver} mask={mask:#x}) ===", ids[id_idx].0);
