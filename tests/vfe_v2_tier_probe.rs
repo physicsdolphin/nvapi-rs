@@ -248,19 +248,28 @@ fn vfe_v2_tier_probe() {
         }
     }
 
-    // V2 写臂 v3:完整工厂记录 base。单 var GET var0 → 160B 记录原样保留,
-    // 只改 min/max/applied/value(type 保留 7 与强制 13 双臂)→ SET → 单 bit 读回。
-    if std::env::var("NVOC_ALLOW_VFE_WRITE").is_ok() {
-        println!("=== Var V2 full-record SET (factory base, two type variants) ===");
+    // V2 写臂 v4(§13.3 设计):**var0(NVVDD REL offset)单变量单会话**。
+    // 门 = NVOC_ALLOW_VFE_VAR0_WRITE(与 DANGER sweep 的 NVOC_ALLOW_VFE_WRITE
+    // 分离——sweep 是死锁事故臂,绝不共门)。值 = NVOC_VFE_VAR0_VALUE_UV
+    // (默认 20000 = +20mV,stock ceiling 语义对齐)。工厂记录原样作 base
+    // (50 系 type=13 天然 SET-ready),只 patch min/max/applied/value → SET
+    // → 读回+墙值三查(before/mid/after)→ 工厂记录 SET 回还原 → 复核。
+    if std::env::var("NVOC_ALLOW_VFE_VAR0_WRITE").is_ok() {
+        println!("=== [WRITE] var0 (NVVDD REL offset) single-var SET + auto-restore ===");
         use nvapi::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
+        let value: f32 = std::env::var("NVOC_VFE_VAR0_VALUE_UV")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(20000.0);
+        println!("  target value = {value} uV (offset)");
         let walls = |tag: &str| {
             if let Ok(r) = gpu.volt_rails() {
                 if let Some(s) = r.status.first() {
-                    println!("  [{tag}] rail0 status: {:?}", s.values);
+                    // [current, target-wall, vbios-wall, effective, vrm-max, min-hold]
+                    println!("  [{tag}] rail0 status uV: {:?}", s.values);
                 }
             }
         };
-        walls("before");
         let single_get = |idx: usize| -> Vec<u8> {
             let mut req = vec![0u8; 40904];
             req[0..4].copy_from_slice(&171976u32.to_le_bytes());
@@ -268,51 +277,57 @@ fn vfe_v2_tier_probe() {
             unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) };
             req
         };
+        walls("before");
         let factory = single_get(0);
         let rec = 104usize;
         let f_type = u32::from_le_bytes(factory[rec..rec + 4].try_into().unwrap());
         println!(
-            "factory var0: type={f_type} min={} max={} applied={} value={} record_bytes_nonzero={}",
+            "factory var0: type={f_type} min={} max={} applied={} value={}",
             f32::from_le_bytes(factory[rec + 4..rec + 8].try_into().unwrap()),
             f32::from_le_bytes(factory[rec + 8..rec + 12].try_into().unwrap()),
             factory[rec + 44],
             f32::from_le_bytes(factory[rec + 48..rec + 52].try_into().unwrap()),
-            factory[rec..rec + 160].iter().filter(|&b| *b != 0).count()
         );
 
-        for (label, force_type) in [("keep-type7", None), ("force-type13", Some(13u32))] {
-            let mut req = factory.clone();
-            for x in req[4..36].iter_mut() {
-                *x = 0;
-            }
-            req[4] = 1; // 单 bit0
-            if let Some(t) = force_type {
-                req[rec..rec + 4].copy_from_slice(&t.to_le_bytes());
-            }
-            let value = 6250.0f32;
-            req[rec + 4..rec + 8].copy_from_slice(&value.min(0.0).to_le_bytes());
-            req[rec + 8..rec + 12].copy_from_slice(&value.max(0.0).to_le_bytes());
-            req[rec + 44] = 1;
-            req[rec + 48..rec + 52].copy_from_slice(&value.to_le_bytes());
-            let st_set =
-                unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let back = single_get(0);
-            let rd_t = u32::from_le_bytes(back[rec..rec + 4].try_into().unwrap());
-            let rd_ap = back[rec + 44];
-            let rd_v = f32::from_le_bytes(back[rec + 48..rec + 52].try_into().unwrap());
-            println!(
-                "  [{label}] SET={st_set} readback: type={rd_t} applied={rd_ap} value={rd_v} {}",
-                if rd_ap == 1 {
-                    "<— RETAINED"
-                } else {
-                    "(dropped)"
-                }
-            );
-            // 还原工厂
-            unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, factory.as_ptr().cast()) };
-            std::thread::sleep(std::time::Duration::from_millis(150));
+        // patch:单 bit0 掩码 + min/max/applied/value,其余字节原样
+        let mut req = factory.clone();
+        for x in req[4..36].iter_mut() {
+            *x = 0;
         }
+        req[4] = 1;
+        req[rec + 4..rec + 8].copy_from_slice(&value.min(0.0).to_le_bytes());
+        req[rec + 8..rec + 12].copy_from_slice(&value.max(0.0).to_le_bytes());
+        req[rec + 44] = 1;
+        req[rec + 48..rec + 52].copy_from_slice(&value.to_le_bytes());
+        let st_set = unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let back = single_get(0);
+        let rd_ap = back[rec + 44];
+        let rd_v = f32::from_le_bytes(back[rec + 48..rec + 52].try_into().unwrap());
+        println!(
+            "  SET={st_set} readback: applied={rd_ap} value={rd_v} {}",
+            if rd_ap == 1 && rd_v == value {
+                "<— RETAINED"
+            } else {
+                "(dropped/mismatch)"
+            }
+        );
+        walls("mid");
+
+        // 还原:工厂记录原样 SET 回(applied=0/value=0)
+        unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, factory.as_ptr().cast()) };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let rst = single_get(0);
+        let rs_ap = rst[rec + 44];
+        let rs_v = f32::from_le_bytes(rst[rec + 48..rec + 52].try_into().unwrap());
+        println!(
+            "  restore readback: applied={rs_ap} value={rs_v} {}",
+            if rs_ap == 0 {
+                "<— restored"
+            } else {
+                "<— RESTORE FAILED, rerun with value=0 or reboot"
+            }
+        );
         walls("after");
     }
 
