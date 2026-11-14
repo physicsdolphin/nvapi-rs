@@ -1181,6 +1181,94 @@ fn vfe_v2_tier_probe() {
             }
         }
     }
+    // ============ 第十轮:mVolt 全链复刻写臂(V10)============
+    // RE 依据(§14):mVolt B700 = VarControl GET(32B 身份@4,无掩码)+
+    // 6220B 对象 GET(stamp 137292)→ 98B0 校验;C6F0 SET = 响应原样回传 +
+    // 掩码 bit + 160·v+108/112/148/152 patch。本轮:先 GET 6220B 对象 +
+    // 身份版 VarControl GET(打印 @4..40 回显行为),再 verbatim SET。
+    if std::env::var("NVOC_ALLOW_VFE_VAR0_WRITE").is_ok() && std::env::var("NVOC_VFE_MVOLT_FLOW").is_ok() {
+        let idx: usize = std::env::var("NVOC_VFE_VAR_INDEX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4);
+        let value: f32 = std::env::var("NVOC_VFE_VAR0_VALUE_UV")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(20000.0);
+        println!("=== [V10] mVolt-replication flow: var{idx} value={value}uV ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
+        // ①6220B 第二对象 GET(stamp 137292,mVolt 每次 B700 都读它)
+        let mut st6220 = vec![0u8; 6220];
+        st6220[0..4].copy_from_slice(&137292u32.to_le_bytes());
+        let st6 = unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, st6220.as_mut_ptr().cast()) } as i32;
+        println!(
+            "  6220B object GET: st={st6} nz={} head4={:?}",
+            nonzero_dwords(&st6220, usize::MAX).len(),
+            &st6220[4..24]
+        );
+        // ②身份版 VarControl GET(ident32@4 = 小戳响应前 32B,无掩码 —— B700 同款)
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident32: Vec<u8> = small[0..32].to_vec();
+        let mut req = vec![0u8; 40904];
+        req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+        req[4..36].copy_from_slice(&ident32);
+        let st_g = unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) } as i32;
+        println!(
+            "  ident32 GET: st={st_g} nz={} echo@4..36={:?}",
+            nonzero_dwords(&req, usize::MAX).len(),
+            &req[4..36]
+        );
+        let rec = 104 + 160 * idx;
+        println!(
+            "  factory var{idx}@{rec}: type={} min={} max={} applied={} value={}",
+            u32::from_le_bytes(req[rec..rec + 4].try_into().unwrap()),
+            f32::from_le_bytes(req[rec + 4..rec + 8].try_into().unwrap()),
+            f32::from_le_bytes(req[rec + 8..rec + 12].try_into().unwrap()),
+            req[rec + 148],
+            f32::from_le_bytes(req[rec + 152..rec + 156].try_into().unwrap()),
+        );
+        let walls = |tag: &str| {
+            if let Ok(r) = gpu.volt_rails() {
+                if let Some(s) = r.status.first() {
+                    println!("  [{tag}] rail0 status uV: {:?}", s.values);
+                }
+            }
+        };
+        walls("before");
+        // ③patch(与 round-4 同字段)+ 掩码 bit(OR 进响应原样字节 —— verbatim)
+        req[4 + idx / 8] |= 1 << (idx % 8);
+        req[rec + 108..rec + 112].copy_from_slice(&value.min(0.0).to_le_bytes());
+        req[rec + 112..rec + 116].copy_from_slice(&value.max(0.0).to_le_bytes());
+        req[rec + 148] = 1;
+        req[rec + 152..rec + 156].copy_from_slice(&value.to_le_bytes());
+        let st_s = unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // ④读回(同款身份版 GET)+ 墙值
+        let mut back = vec![0u8; 40904];
+        back[0..4].copy_from_slice(&171976u32.to_le_bytes());
+        back[4..36].copy_from_slice(&ident32);
+        unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, back.as_mut_ptr().cast()) };
+        let rd_ap = back[rec + 148];
+        let rd_v = f32::from_le_bytes(back[rec + 152..rec + 156].try_into().unwrap());
+        println!(
+            "  SET={st_s} readback: applied={rd_ap} value={rd_v} {}",
+            if rd_ap == 1 && rd_v == value { "<— RETAINED" } else { "(dropped/mismatch)" }
+        );
+        walls("mid");
+        // ⑤还原(工厂 GET → verbatim SET 回)
+        let mut rst = vec![0u8; 40904];
+        rst[0..4].copy_from_slice(&171976u32.to_le_bytes());
+        rst[4..36].copy_from_slice(&ident32);
+        unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, rst.as_mut_ptr().cast()) };
+        unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, rst.as_ptr().cast()) };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        walls("after");
+    }
     let _ = ptr::null_mut::<u8>();
     let _ = ptr::null_mut::<u8>();
 }
