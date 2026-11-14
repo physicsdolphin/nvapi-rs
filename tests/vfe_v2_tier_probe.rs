@@ -589,5 +589,72 @@ fn vfe_v2_tier_probe() {
             nonzero_dwords(&eb, usize::MAX).len()
         );
     }
+    // VarGetInfo 大层(0x2F9568)掩码版 GET(零身份,+4=掩码):19 记录逐 dword
+    // dump + 字符串 hunt。早前实测:零身份返回 mask 0x7FFFF + 记录 @296 stride 276。
+    {
+        println!("=== Var GetInfo V2 mask-only GET — 19-record dword dump ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeVarGetInfo;
+        let size = 2856296usize;
+        let mut b = vec![0u8; size];
+        b[0..4].copy_from_slice(&3118440u32.to_le_bytes());
+        // 掩码:19 位(与工厂目录一致)
+        b[4] = 0xFF;
+        b[5] = 0xFF;
+        b[6] = 0x07;
+        let st = unsafe { NvAPI_GPU_PerfVfeVarGetInfo(handle, b.as_mut_ptr().cast()) } as i32;
+        println!("GET status={st}");
+        // 找记录基:扫描前 400 字节的非零分布
+        let mut nz_head = Vec::new();
+        for (i, w) in b[..4096].chunks_exact(4).enumerate() {
+            let v = u32::from_le_bytes(w.try_into().unwrap());
+            if v != 0 {
+                nz_head.push((i * 4, v));
+            }
+        }
+        println!("head nonzero (first 4KB): {nz_head:?}");
+        // 记录基尝试 +296 stride 276(早前实测)
+        for entry in 0..19usize {
+            let base = 296 + 276 * entry;
+            if base + 276 > size {
+                break;
+            }
+            let mut fields = Vec::new();
+            for (i, w) in b[base..base + 276].chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap());
+                if v != 0 {
+                    let f = f32::from_le_bytes(v.to_le_bytes());
+                    fields.push(format!("+{:03X}:{v:#x}(f32 {f:.3?})", i * 4));
+                }
+            }
+            if !fields.is_empty() {
+                println!("  entry{entry}@{base:X}: {}", fields.join(" "));
+            }
+        }
+        // ASCII 串 hunt(整缓冲)
+        let mut found = 0usize;
+        let mut i2 = 4usize;
+        while i2 + 1 < size && found < 30 {
+            let mut chars = Vec::new();
+            let mut j = i2;
+            while j < size {
+                let c = b[j];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b'/' || c == b'[' || c == b']' {
+                    chars.push(c);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if chars.len() >= 5 {
+                println!("  ascii@+{i2:06X}: {}", String::from_utf8_lossy(&chars));
+                found += 1;
+                i2 = j + 1;
+            } else {
+                i2 += 1;
+            }
+        }
+        println!("ascii strings: {found}");
+    }
+    let _ = ptr::null_mut::<u8>();
     let _ = ptr::null_mut::<u8>();
 }
