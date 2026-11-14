@@ -216,13 +216,42 @@ fn vfe_v2_tier_probe() {
     } else {
         println!("write arm skipped — set NVOC_ALLOW_VFE_PERTURB=1");
     }
-    // V2 写臂(NVOC_ALLOW_VFE_WRITE=1):RM 位号穷举。布局(mVolt sub_14028C6F0
-    // 定案):blob = stamp@0 + 掩码 32B@4 + 记录区@36(160B/记录,按 RM 位号索引);
-    // 记录内 float[27]=min byte108 / float[28]=max byte112 / byte[148]=applied /
-    // float[38]=value byte152。试探:掩码单 bit b + value=1.0f(1µV 无害)+
-    // applied=1 → SET → GET 查保留 → 命中即位号+布局双确认 → applied=0 还原。
-    if std::env::var("NVOC_ALLOW_VFE_WRITE").is_ok() && st_m == 0 {
-        println!("=== Var V2 RM-bit brute force (harmless 1uV probe) ===");
+    // V2 目录扫描:255 var 逐个单 bit GET(type/min/max/applied/value),
+    // 建工厂变量全目录。GET-only,无写。
+    {
+        println!("=== Var V2 factory directory scan (255 vars) ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeVarGetControl;
+        let mut rows = Vec::new();
+        for idx in 0..255usize {
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            req[4 + idx / 8] = 1 << (idx % 8);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) } as i32;
+            if st != 0 {
+                continue;
+            }
+            let rec = 104 + 160 * idx;
+            let t = u32::from_le_bytes(req[rec..rec + 4].try_into().unwrap());
+            if t == 0 {
+                continue;
+            }
+            let mn = f32::from_le_bytes(req[rec + 4..rec + 8].try_into().unwrap());
+            let mx = f32::from_le_bytes(req[rec + 8..rec + 12].try_into().unwrap());
+            let ap = req[rec + 44];
+            let vl = f32::from_le_bytes(req[rec + 48..rec + 52].try_into().unwrap());
+            rows.push((idx, t, mn, mx, ap, vl));
+        }
+        println!("populated vars: {}/255", rows.len());
+        for (idx, t, mn, mx, ap, vl) in &rows {
+            println!("  var{idx}: type={t} min={mn} max={mx} applied={ap} value={vl}");
+        }
+    }
+
+    // V2 写臂 v3:完整工厂记录 base。单 var GET var0 → 160B 记录原样保留,
+    // 只改 min/max/applied/value(type 保留 7 与强制 13 双臂)→ SET → 单 bit 读回。
+    if std::env::var("NVOC_ALLOW_VFE_WRITE").is_ok() {
+        println!("=== Var V2 full-record SET (factory base, two type variants) ===");
         use nvapi::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
         let walls = |tag: &str| {
             if let Ok(r) = gpu.volt_rails() {
@@ -232,57 +261,61 @@ fn vfe_v2_tier_probe() {
             }
         };
         walls("before");
-        let mut found: Vec<usize> = Vec::new();
-        for bit in 0..256usize {
-            let mut req = buf_m.clone();
-            // 清掩码区,置单 bit
-            for b in req[4..36].iter_mut() {
-                *b = 0;
+        let single_get = |idx: usize| -> Vec<u8> {
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            req[4 + idx / 8] = 1 << (idx % 8);
+            unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) };
+            req
+        };
+        let factory = single_get(0);
+        let rec = 104usize;
+        let f_type = u32::from_le_bytes(factory[rec..rec + 4].try_into().unwrap());
+        println!(
+            "factory var0: type={f_type} min={} max={} applied={} value={} record_bytes_nonzero={}",
+            f32::from_le_bytes(factory[rec + 4..rec + 8].try_into().unwrap()),
+            f32::from_le_bytes(factory[rec + 8..rec + 12].try_into().unwrap()),
+            factory[rec + 44],
+            f32::from_le_bytes(factory[rec + 48..rec + 52].try_into().unwrap()),
+            factory[rec..rec + 160].iter().filter(|&b| *b != 0).count()
+        );
+
+        for (label, force_type) in [("keep-type7", None), ("force-type13", Some(13u32))] {
+            let mut req = factory.clone();
+            for x in req[4..36].iter_mut() {
+                *x = 0;
             }
-            req[4 + bit / 8] = 1 << (bit % 8);
-            // 记录区:base = 36 + 160*bit
-            let rec = 36 + 160 * bit;
-            if rec + 160 > req.len() {
-                break;
+            req[4] = 1; // 单 bit0
+            if let Some(t) = force_type {
+                req[rec..rec + 4].copy_from_slice(&t.to_le_bytes());
             }
-            // min=-100000.0f max=100000.0f applied=1 value=1.0f
-            req[rec + 108..rec + 112].copy_from_slice(&(-100000.0f32).to_le_bytes());
-            req[rec + 112..rec + 116].copy_from_slice(&(100000.0f32).to_le_bytes());
-            req[rec + 148] = 1;
-            req[rec + 152..rec + 156].copy_from_slice(&(1.0f32).to_le_bytes());
+            let value = 6250.0f32;
+            req[rec + 4..rec + 8].copy_from_slice(&value.min(0.0).to_le_bytes());
+            req[rec + 8..rec + 12].copy_from_slice(&value.max(0.0).to_le_bytes());
+            req[rec + 44] = 1;
+            req[rec + 48..rec + 52].copy_from_slice(&value.to_le_bytes());
             let st_set =
                 unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
-            if st_set != 0 {
-                println!("  bit {bit}: SET refused {st_set:#x}");
-                continue;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            let (_, resp) = get_raw(
-                |h, p| unsafe { NvAPI_GPU_PerfVfeVarGetControl(h, p.cast()) },
-                handle,
-                171976,
-                40904,
-                &mask_all,
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let back = single_get(0);
+            let rd_t = u32::from_le_bytes(back[rec..rec + 4].try_into().unwrap());
+            let rd_ap = back[rec + 44];
+            let rd_v = f32::from_le_bytes(back[rec + 48..rec + 52].try_into().unwrap());
+            println!(
+                "  [{label}] SET={st_set} readback: type={rd_t} applied={rd_ap} value={rd_v} {}",
+                if rd_ap == 1 {
+                    "<— RETAINED"
+                } else {
+                    "(dropped)"
+                }
             );
-            let rb_v = f32::from_le_bytes(resp[rec + 152..rec + 156].try_into().unwrap());
-            let rb_a = resp[rec + 148];
-            if rb_a == 1 && rb_v == 1.0 {
-                println!("  bit {bit}: RETAINED (applied=1, value=1.0f) — ACTIVE VAR SLOT");
-                found.push(bit);
-            }
-            // 还原:applied=0 value=0
-            let mut rst = req;
-            rst[rec + 148] = 0;
-            rst[rec + 152..rec + 156].copy_from_slice(&0.0f32.to_le_bytes());
-            unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, rst.as_ptr().cast()) };
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            // 还原工厂
+            unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, factory.as_ptr().cast()) };
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
-        println!("found active var RM bits: {found:?}");
         walls("after");
-        if !found.is_empty() {
-            println!(">>> mVolt override-store protocol VIABLE on this machine <<<");
-        }
     }
+
     // 身份自举实验:小戳 EquGetControl(85016)raw 响应中找非零区块 →
     // 候选 1024B/32B 切片回喂 V2 GET → 量丰富度。
     {
@@ -352,6 +385,139 @@ fn vfe_v2_tier_probe() {
                 println!("    *** RICH — identity candidate found ***");
             }
         }
+    }
+    // 请求形状扫描:Var V2 GET 的 身份/掩码 摆放位置穷举(丰富度判据)。
+    // 候选形状:S1 mask32@4(基线) / S2 ident1024@4 / S3 mask32@4+ident1024@36 /
+    // S4 ident1024@36+mask32@4 / S5 ident32@4+ident992@36。
+    {
+        println!("=== Var V2 request-shape sweep (richness criterion) ===");
+        // ident1024 = 小戳 EquGetControl 响应 @0..1024(已证实可过 Equ V2 门)
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeEquGetControl;
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        let st_s =
+            unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) } as i32;
+        println!("small-tier GET status={st_s}");
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
+        let ident32: Vec<u8> = ident1024[..32].to_vec();
+
+        let mut mk = |stamp: u32, size: usize, layout: &dyn Fn(&mut [u8])| -> (i32, usize) {
+            let mut b = vec![0u8; size];
+            b[0..4].copy_from_slice(&stamp.to_le_bytes());
+            layout(&mut b);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, b.as_mut_ptr().cast()) } as i32;
+            let r = nonzero_dwords(&b, usize::MAX).len();
+            (st, r)
+        };
+
+        let shapes: Vec<(&str, Box<dyn Fn(&mut [u8])>)> = vec![
+            (
+                "S1 mask32@4",
+                Box::new(|b: &mut [u8]| {
+                    for i in 0..25 {
+                        b[4 + i] = 0xFF;
+                    }
+                }),
+            ),
+            (
+                "S2 ident1024@4",
+                Box::new(|b: &mut [u8]| {
+                    b[4..1028].copy_from_slice(&ident1024);
+                }),
+            ),
+            (
+                "S3 mask32@4+ident1024@36",
+                Box::new(|b: &mut [u8]| {
+                    for i in 0..25 {
+                        b[4 + i] = 0xFF;
+                    }
+                    b[36..1060].copy_from_slice(&ident1024);
+                }),
+            ),
+            (
+                "S4 ident1024@36+mask32@4",
+                Box::new(|b: &mut [u8]| {
+                    for i in 0..25 {
+                        b[4 + i] = 0xFF;
+                    }
+                    b[36..1060].copy_from_slice(&ident1024);
+                }),
+            ),
+            (
+                "S5 ident32@4+ident992@36",
+                Box::new(|b: &mut [u8]| {
+                    b[4..36].copy_from_slice(&ident32);
+                    b[36..1028].copy_from_slice(&ident1024[32..1024]);
+                }),
+            ),
+            (
+                "S6 ident1024@4+mask32@1028",
+                Box::new(|b: &mut [u8]| {
+                    b[4..1028].copy_from_slice(&ident1024);
+                    for i in 0..25 {
+                        b[1028 + i] = 0xFF;
+                    }
+                }),
+            ),
+        ];
+        for (label, layout) in &shapes {
+            let (st, r) = mk(171976, 40904, layout.as_ref());
+            println!("  {label}: status={st}, richness={r}");
+            if r > 12 {
+                println!("    *** RICH — Var V2 GET shape found ***");
+            }
+        }
+        // S3 形状完整非零分布 + float 解读(墙值对齐:1125/1093.75/1068.75/712.5)
+        {
+            let mut b = vec![0u8; 40904];
+            b[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            for i in 0..25 {
+                b[4 + i] = 0xFF;
+            }
+            b[36..1060].copy_from_slice(&ident1024);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, b.as_mut_ptr().cast()) } as i32;
+            println!("S3 full dump: status={st}");
+            let nz = nonzero_dwords(&b, usize::MAX);
+            println!("total nonzero: {}", nz.len());
+            let walls = [
+                1125.0f32, 1093.75, 1068.75, 712.5, 1125000.0, 1093750.0, 1068750.0, 712500.0,
+                130.0, 60.0, 80.0, 32.0,
+            ];
+            for (off, v) in nz.iter().take(40) {
+                let f = f32::from_le_bytes(v.to_le_bytes());
+                let wall_tag = if walls.iter().any(|w| (w - f).abs() < 0.01) {
+                    " <— WALL MATCH"
+                } else {
+                    ""
+                };
+                println!("  +{off:04X}: {v:#010x} (f32 {f}{wall_tag})");
+            }
+            // 全表墙值搜索(不限前 40)
+            let mut hits = 0usize;
+            for (off, v) in &nz {
+                let f = f32::from_le_bytes(v.to_le_bytes());
+                if walls.iter().any(|w| (w - f).abs() < 0.01) {
+                    println!("  WALL@+{off:04X} = {f}");
+                    hits += 1;
+                }
+            }
+            println!("wall-value hits: {hits}");
+        }
+
+        // 对照:Equ V2 用 S2 形状(身份@4)应保持 rich
+        let mut eb = vec![0u8; 1410116];
+        eb[0..4].copy_from_slice(&1410116u32.to_le_bytes());
+        eb[4..1028].copy_from_slice(&ident1024);
+        let st_e = unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, eb.as_mut_ptr().cast()) } as i32;
+        println!(
+            "Equ V2 ident@4 control: status={st_e}, richness={}",
+            nonzero_dwords(&eb, usize::MAX).len()
+        );
     }
     let _ = ptr::null_mut::<u8>();
 }
