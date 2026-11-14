@@ -80,7 +80,7 @@ fn vfe_v2_tier_probe() {
     let zero32 = [0u8; 32];
     let zero1024 = [0u8; 1024];
 
-    println!("=== Var GetControl V2 (0x2A008, 40904B, 32B identity@+4) ===");
+    println!("=== Var GetControl V2 (0x29FC8, 40904B, 32B identity@+4) ===");
     let (st, buf) = get_raw(
         |h, p| unsafe { NvAPI_GPU_PerfVfeVarGetControl(h, p.cast()) },
         handle,
@@ -119,7 +119,7 @@ fn vfe_v2_tier_probe() {
     );
     println!("status={st_e} ({st_e:#x})");
 
-    println!("=== Equ GetControl 0x1584C4 (1410116B, 1024B identity@+4) ===");
+    println!("=== Equ GetControl 0x158444 (1410116B, 1024B identity@+4) ===");
     let (st_c, buf_c) = get_raw(
         |h, p| unsafe { NvAPI_GPU_PerfVfeEquGetControl(h, p.cast()) },
         handle,
@@ -654,6 +654,258 @@ fn vfe_v2_tier_probe() {
             }
         }
         println!("ascii strings: {found}");
+    }
+    // ============ 第七轮(2026-11-15,5060 Ti 目录判决已回)============
+    // 5060 Ti 实测:76/255 populated;var45(type9,450000..1250000µV)=电压域候选
+    // (2070 var13 同角色,索引漂移实锤);var14=频率类;var15/16=百分比类。
+    // 采样时活体墙(melonVolt offset +200mV 已消费):VBIOS 1220mV/VRM 1200/
+    // ceiling 200mV/min-hold 625mV/当前 1145mV;stock 墙=1020/1200/635/20mV。
+    // ⇒ S3 记录里的 20000(=stock ceiling 20mV)提示 76B 记录携带工厂快照值。
+    // 本轮全 GET-only:①info 全条目(RM name ID) ②160B 工厂记录全 dump
+    // ③单 bit+身份 record↔index 钉死 ④Equ 层墙值定位 ⑤身份块授权域对比。
+    let wall_set: &[(&str, f32)] = &[
+        ("VBIOS-wall-now-1220mV", 1220000.0),
+        ("OV-VRM-wall-1200mV", 1200000.0),
+        ("current-1145mV", 1145000.0),
+        ("minhold-now-625mV", 625000.0),
+        ("ceiling-now-200mV", 200000.0),
+        ("VBIOS-wall-stock-1020mV", 1020000.0),
+        ("stock-wall-1000mV", 1000000.0),
+        ("minhold-stock-635mV", 635000.0),
+        ("stock-ceiling-20mV", 20000.0),
+        ("VRM-min-400mV", 400000.0),
+        ("VRM-max-1280mV", 1280000.0),
+        ("VRM-default-900mV", 900000.0),
+        ("descA-800mV", 800000.0),
+        ("descB-700mV", 700000.0),
+        ("obs-810mV", 810000.0),
+        ("obs-1100mV", 1100000.0),
+        ("var45max-1250mV", 1250000.0),
+        ("var45min-450mV", 450000.0),
+    ];
+    let wall_tag = |f: f32| -> String {
+        wall_set
+            .iter()
+            .find(|item| (item.1 - f).abs() < 0.5)
+            .map(|item| format!(" <{}>", item.0))
+            .unwrap_or_default()
+    };
+
+    // [H1] VarGetInfo 全掩码(256 位)全条目 dump —— RM name ID 收集
+    {
+        println!("=== [H1] Var GetInfo V2 FULL-mask (256 bits) all-entry dump ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeVarGetInfo;
+        let size = 2856296usize;
+        let mut b = vec![0u8; size];
+        b[0..4].copy_from_slice(&3118440u32.to_le_bytes());
+        for i in 0..32 {
+            b[4 + i] = 0xFF;
+        }
+        let st = unsafe { NvAPI_GPU_PerfVfeVarGetInfo(handle, b.as_mut_ptr().cast()) } as i32;
+        println!("GET status={st}");
+        let mut nz_head = Vec::new();
+        for (i, w) in b[..4096].chunks_exact(4).enumerate() {
+            let v = u32::from_le_bytes(w.try_into().unwrap());
+            if v != 0 {
+                nz_head.push((i * 4, v));
+            }
+        }
+        println!("head nonzero (first 4KB): {nz_head:?}");
+        let mut populated = 0usize;
+        for k in 0..300usize {
+            let base = 296 + 276 * k;
+            if base + 276 > size {
+                break;
+            }
+            let t = u32::from_le_bytes(b[base..base + 4].try_into().unwrap());
+            if t == 0 {
+                continue;
+            }
+            populated += 1;
+            let mut fields = Vec::new();
+            for (i, w) in b[base..base + 276].chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap());
+                if v != 0 {
+                    fields.push(format!("+{:03X}:{v:#010x}(lo16 {:#06x})", i * 4, v & 0xFFFF));
+                }
+            }
+            println!("  entry{k}@{base:X}: type={t} {}", fields.join(" "));
+        }
+        println!("populated info entries: {populated}");
+    }
+
+    // [H2+H3] populated var 全记录:160B 工厂记录(round-4 几何)+ 单 bit+身份
+    // S3 形态 GET(record↔index 钉死;S3 记录区 @136 步进 76)
+    {
+        println!("=== [H2+H3] per-var factory record + identity GET (record<->index pin) ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl};
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
+
+        let mut populated = Vec::new();
+        for idx in 0..255usize {
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            req[4 + idx / 8] = 1 << (idx % 8);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) } as i32;
+            if st != 0 {
+                continue;
+            }
+            let rec = 104 + 160 * idx;
+            let t = u32::from_le_bytes(req[rec..rec + 4].try_into().unwrap());
+            if t == 0 {
+                continue;
+            }
+            populated.push(idx);
+            let mut fields = Vec::new();
+            for (i, w) in req[rec..rec + 160].chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap());
+                if v != 0 {
+                    let f = f32::from_le_bytes(v.to_le_bytes());
+                    fields.push(format!("+{:02X}:{v:#010x}(f32 {f:.3?}){}", i * 4, wall_tag(f)));
+                }
+            }
+            println!("  var{idx} factory@{rec}: {}", fields.join(" "));
+        }
+        println!("populated: {} vars — {:?}", populated.len(), populated);
+
+        println!("  --- single-bit + identity (S3 shape) ---");
+        for idx in &populated {
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            req[4 + idx / 8] = 1 << (idx % 8);
+            req[36..1060].copy_from_slice(&ident1024);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) } as i32;
+            let nz = nonzero_dwords(&req, usize::MAX);
+            let body: Vec<String> = nz
+                .iter()
+                .filter(|(off, _)| *off >= 36)
+                .take(14)
+                .map(|(off, v)| {
+                    let f = f32::from_le_bytes(v.to_le_bytes());
+                    format!("+{off:04X}:{v:#010x}(f32 {f:.3?}){}", wall_tag(f))
+                })
+                .collect();
+            println!("  var{idx}: st={st} nz={} {}", nz.len(), body.join(" "));
+        }
+    }
+
+    // [H4] Equ V2 control(1410116,身份@4)rich dump + 全缓冲墙值搜索
+    // (µV 全套 + mV 标度 400..1280;V/F 方程常数若含墙值即定位消费方程)
+    {
+        println!("=== [H4] Equ V2 control rich dump + wall-value search ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeEquGetControl;
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
+        let mut eb = vec![0u8; 1410116];
+        eb[0..4].copy_from_slice(&1410116u32.to_le_bytes());
+        eb[4..1028].copy_from_slice(&ident1024);
+        let st = unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, eb.as_mut_ptr().cast()) } as i32;
+        let nz = nonzero_dwords(&eb, usize::MAX);
+        println!("status={st} nonzero dwords={}", nz.len());
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        for (off, _) in &nz {
+            match regions.last_mut() {
+                Some(last) if *off <= last.1 + 64 => last.1 = *off + 4,
+                _ => regions.push((*off, *off + 4)),
+            }
+        }
+        println!(
+            "regions ({}): {:?}",
+            regions.len(),
+            &regions[..regions.len().min(24)]
+        );
+        let mv_set: &[(&str, f32)] = &[
+            ("1220mV", 1220.0),
+            ("1200mV", 1200.0),
+            ("1145mV", 1145.0),
+            ("1100mV", 1100.0),
+            ("1020mV", 1020.0),
+            ("1000mV", 1000.0),
+            ("900mV", 900.0),
+            ("810mV", 810.0),
+            ("800mV", 800.0),
+            ("700mV", 700.0),
+            ("635mV", 635.0),
+            ("625mV", 625.0),
+            ("450mV", 450.0),
+            ("400mV", 400.0),
+            ("1280mV", 1280.0),
+            ("1250mV", 1250.0),
+        ];
+        let mut hits = 0usize;
+        for (off, v) in &nz {
+            let f = f32::from_le_bytes(v.to_le_bytes());
+            let uv_tag = wall_set
+                .iter()
+                .find(|item| (item.1 - f).abs() < 0.5)
+                .map(|item| format!("µV {}", item.0));
+            let mv_tag = mv_set
+                .iter()
+                .find(|item| (item.1 - f).abs() < 0.01)
+                .map(|item| format!("mV {}", item.0));
+            if uv_tag.is_some() || mv_tag.is_some() {
+                println!("  HIT @+{off:06X}: {f} ({})", uv_tag.or(mv_tag).unwrap());
+                hits += 1;
+                if hits >= 60 {
+                    break;
+                }
+            }
+        }
+        println!("wall hits: {hits}");
+    }
+
+    // [H5] 6 个 rich 身份块逐个 S3 GET(全掩码)—— 每身份授权的记录集对比
+    {
+        println!("=== [H5] per-identity-block S3 GET (full mask) record dump ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl};
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        for base in [0usize, 100, 176, 252, 328, 404] {
+            let end = (base + 1024).min(small.len());
+            let ident = small[base..end].to_vec();
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            for i in 0..25 {
+                req[4 + i] = 0xFF;
+            }
+            let n = ident.len().min(1024);
+            req[36..36 + n].copy_from_slice(&ident[..n]);
+            let st =
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) } as i32;
+            let mut recs = Vec::new();
+            for k in 0..40usize {
+                let r = 136 + 76 * k;
+                if r + 76 > req.len() {
+                    break;
+                }
+                let t = u32::from_le_bytes(req[r..r + 4].try_into().unwrap());
+                let mn = f32::from_le_bytes(req[r + 4..r + 8].try_into().unwrap());
+                let mx = f32::from_le_bytes(req[r + 8..r + 12].try_into().unwrap());
+                let vl = f32::from_le_bytes(req[r + 44..r + 48].try_into().unwrap());
+                if t != 0 || mn != 0.0 || mx != 0.0 || vl != 0.0 {
+                    recs.push(format!("r{k}[t={t} {mn}..{mx} v={vl}]"));
+                }
+            }
+            let richness = nonzero_dwords(&req, usize::MAX).len();
+            println!("  ident@{base}: st={st} nz={richness} {}", recs.join(" "));
+        }
     }
     let _ = ptr::null_mut::<u8>();
     let _ = ptr::null_mut::<u8>();
