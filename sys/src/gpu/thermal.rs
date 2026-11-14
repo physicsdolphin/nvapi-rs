@@ -588,16 +588,14 @@ pub mod undocumented {
         pub struct NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_ENTRY_V3 {
             /// Channel class — mirrors GetInfo's per-channel `ch_class`.
             pub ch_class: u32,
-            pub rsvd0: Padding<[u8; 4]>,
+            /// Per-input "applied" flag (live-diffed at +4: 0xBC/0x194/0x200
+            /// = 1 for channels 1/3/4 in the mVolt LN2 state = rec_k+4).
+            pub applied: u32,
             /// Temperature-sim override for this channel, celsius*256 (Q8).
             /// 0 = channel follows the real sensor. The mVolt+ "Thermal
             /// inputs" panel writes this field.
             pub sim_temp_q8: i32,
-            pub rsvd1: Padding<[u8; 68]>,
-            /// Per-input "applied" flag (live-diffed at +80: 1 for the inputs
-            /// an mVolt apply covers). Semantics beyond 0/1 unknown.
-            pub applied: u32,
-            pub rsvd2: Padding<[u8; 24]>,
+            pub rsvd1: Padding<[u8; 96]>,
         }
     }
 
