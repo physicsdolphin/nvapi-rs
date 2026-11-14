@@ -383,7 +383,86 @@ fn volt_rails_blackwell_write_probe() {
             }
         }
     }
-    report["write_arms"] = json!({"ctrl_stamp": {"tag": tag, "stamp": stamp}, "c_slot0_diff": c_arm, "d_mirror": d_arm});
+
+    // --- F: V2-stamp (0x20AC8) slot0 payload write on dense0 — mVolt+ drives
+    // V2 while the C arm above picked the first accepted stamp (V1 here); this
+    // closes the "V1 vs V2 SET behaves differently" question.
+    // --- G: control buffer +8 channel — mVolt+ 0.50.13's boost write
+    // (sub_1402085C0 pattern: cached block copy + buf[8] = percent + SET) and
+    // the field READ BACK 100 on this machine while target wall sat at the
+    // vBIOS ceiling. If +8 retains and the status wall follows, the consumed
+    // melonVolt field on Blackwell/621 is buf[8], not the payload dwords.
+    let stamp_v2: u32 = (2u32 << 16) | 2760;
+    let snap2 = ctrl_get(handle, &info, stamp_v2, 2760);
+    let mut f_arm = Vec::new();
+    let mut g_arm = Vec::new();
+    if snap2.status == 0 {
+        let bit0 = (0..32u32).find(|b| rail_mask & (1 << b) != 0).unwrap_or(0);
+        let off0 = ctrl_entry::STRIDE * 0 + ctrl_entry::VALUES - 8; // dense0 slot0 rest offset = 68
+
+        // F: slot0 += step under the V2 stamp
+        let old0 = get_u32(&snap2.bytes, off0);
+        let mut f = snap2.bytes.clone();
+        set_u32(&mut f, off0, (old0 as i32).wrapping_add(step as i32) as u32);
+        let st_f = ctrl_set(handle, &f);
+        let post_f = ctrl_get(handle, &info, stamp_v2, 2760);
+        let diff_f = diff_dwords(&snap2.bytes, &post_f.bytes);
+        println!(
+            "--- F rail{bit0} slot0 V2-stamp: {old0} -> {} SET={st_f}, {} dwords changed ---",
+            (old0 as i32).wrapping_add(step as i32),
+            diff_f.len()
+        );
+        for (off, a, b) in &diff_f {
+            println!("    diff +{off:04x}: {a:#010x} -> {b:#010x}");
+        }
+        if diff_f.is_empty() {
+            println!("    V2-stamp payload write also consumed nowhere");
+        }
+        f_arm.push(json!({"bit": bit0, "wrote": (old0 as i32).wrapping_add(step as i32),
+            "set_status": st_f, "diff": diff_f.iter().map(|(o, a, b)| json!({"off": o, "old": a, "new": b})).collect::<Vec<_>>()}));
+
+        // G: buf+8 = 50 (boost channel probe)
+        let cur8 = get_u32(&snap2.bytes, 8);
+        println!("--- G rail{bit0} buf+8 (boost channel): {cur8} -> 50 (V2 stamp) ---");
+        let mut g = snap2.bytes.clone();
+        set_u32(&mut g, 8, 50);
+        let st_g = ctrl_set(handle, &g);
+        let post_g = ctrl_get(handle, &info, stamp_v2, 2760);
+        let kept8 = get_u32(&post_g.bytes, 8);
+        let diff_g = diff_dwords(&snap2.bytes, &post_g.bytes);
+        println!(
+            "    SET={st_g}, buf+8 readback={kept8}, {} dwords changed",
+            diff_g.len()
+        );
+        for (off, a, b) in &diff_g {
+            println!("    diff +{off:04x}: {a:#010x} -> {b:#010x}");
+        }
+        let after_g = gpu.volt_rails().expect("volt_rails after G");
+        for s2 in &after_g.status {
+            println!("    status after: {:?}", s2.values);
+        }
+        g_arm.push(
+            json!({"bit": bit0, "old": cur8, "wrote": 50u32, "readback": kept8,
+            "set_status": st_g, "status_after": after_g.status.iter()
+                .map(|s| json!({"bit": s.rail_bit, "values": s.values})).collect::<Vec<_>>()}),
+        );
+
+        // restore + verify (byte-exact)
+        let st_gr = ctrl_set(handle, &snap2.bytes);
+        let restored2 = ctrl_get(handle, &info, stamp_v2, 2760);
+        let same2 = restored2.bytes == snap2.bytes;
+        println!("    restore: SET={st_gr} byte-exact={same2}");
+        if !same2 {
+            let d = diff_dwords(&snap2.bytes, &restored2.bytes);
+            panic!("rail{bit0} V2 RESTORE FAILED (SET={st_gr}) — remaining diffs {d:?}");
+        }
+    } else {
+        println!(
+            "F/G arms skipped — V2 stamp GET refused ({:#x})",
+            snap2.status
+        );
+    }
+    report["write_arms"] = json!({"ctrl_stamp": {"tag": tag, "stamp": stamp}, "c_slot0_diff": c_arm, "d_mirror": d_arm, "f_v2_slot0": f_arm, "g_boost_ch8": g_arm});
 
     // --- E: API-level writes (exercises the honest RetainMismatch error) ---
     let mut e_arm = Vec::new();
@@ -414,7 +493,7 @@ fn volt_rails_blackwell_write_probe() {
 
     write_report(&report);
     println!(
-        "DONE — 判读：C 臂全缓冲 diff 为空 ⇒ 写未被任何字段消费（H2/H3）；diff 非空但不在 val_off ⇒ 几何错位（H1，真槽位即 diff 偏移）；D 臂 mirror 保留 ⇒ 零块未初始化是门；B 臂 0x21620(5664B) 若为唯一 accepted stamp ⇒ H4 成立"
+        "DONE — 判读：C/F 臂全缓冲 diff 为空 ⇒ payload 写未被任何字段消费（H1 排除）；G 臂 buf+8 保留且 status 墙随动 ⇒ +8=boost/策略通道是被消费字段（Blackwell/621 真车道）；D 臂 mirror 不保留 ⇒ 零块未初始化假说死"
     );
 }
 
