@@ -15,7 +15,7 @@
 #![allow(unused_must_use)]
 
 use nvapi::PhysicalGpu;
-use nvapi::sys::api::NvAPI_GPU_ThermChannelGetControl;
+use nvapi::sys::api::{NvAPI_GPU_ThermChannelGetControl, NvAPI_GPU_ThermChannelSetControl};
 
 fn nonzero_dwords(buf: &[u8], max: usize) -> Vec<(usize, u32)> {
     let mut out = Vec::new();
@@ -101,37 +101,59 @@ fn thermal_channel_probe() {
         }
         Err(e) => println!("GetStatus failed: {e:?}"),
     }
-
-    // ---- ③ GetControl 版本魔数 size 扫描（布局发现主实验）----
-    // 版本魔数 (2<<16)|size；接受者返回 0。全 GET 安全。
-    println!("=== [T3] ThermChannelGetControl size sweep (ver=(2<<16)|N) ===");
-    let mut accepted = Vec::new();
-    for size in [168usize, 232, 264, 296, 328, 360, 392, 424, 456, 488, 520, 1048, 72, 104, 136, 200, 8, 40, 56] {
-        let mut buf = vec![0u8; size];
-        let ver: u32 = ((2u32) << 16) | (size as u32 & 0xFFFF);
-        buf[0..4].copy_from_slice(&ver.to_le_bytes());
-        // 掩码区（仿 INFO/STATUS 布局）：全 32 bit
-        if size >= 12 {
-            buf[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    // ---- ③ GetControl 扫描 v2：掩码感知（真实 mask / 单 bit / 0）× 两 ID × ver 1/2
+    // 上一轮全 -9 的首要嫌疑=掩码硬编 0xFFFFFFFF（含未充填通道位，仿 VFE 全掩码拒绝模式）。
+    println!("=== [T3] Control sweep: ids x masks x ver x sizes ===");
+    type ControlFn = unsafe fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void) -> nvapi::sys::NvAPI_Status;
+    let ids: [(&str, ControlFn); 2] = [
+        ("GetControl 0xA933CE98", NvAPI_GPU_ThermChannelGetControl),
+        ("SetControl 0x8DF19FA2", NvAPI_GPU_ThermChannelSetControl),
+    ];
+    let masks: [(u32, &str); 4] = [
+        (channel_mask, "info-mask"),
+        (0, "zero"),
+        (1, "bit0"),
+        (0x1cfff, "0x1cfff"),
+    ];
+    let sizes = [168usize, 232, 264, 296, 328, 360, 392, 424, 456, 488, 520, 1048, 72, 104, 136, 200, 8, 40, 56, 88, 120, 152, 184, 216, 248, 280, 312, 344, 376, 408, 440, 472, 504];
+    let mut accepted: Vec<(usize, usize, u32, u32)> = Vec::new(); // (id_idx, size, ver, mask)
+    for (id_idx, (id_name, id_fn)) in ids.iter().enumerate() {
+        for (mask, mask_name) in masks {
+            for ver in [2u32, 1u32] {
+                for size in sizes {
+                    let mut buf = vec![0u8; size];
+                    let v: u32 = (ver << 16) | (size as u32 & 0xFFFF);
+                    buf[0..4].copy_from_slice(&v.to_le_bytes());
+                    if size >= 8 {
+                        buf[4..8].copy_from_slice(&mask.to_le_bytes());
+                    }
+                    let st = unsafe { id_fn(handle, buf.as_mut_ptr().cast()) } as i32;
+                    if st == 0 {
+                        accepted.push((id_idx, size, ver, mask));
+                        println!("  HIT {id_name} size={size} ver={ver} mask={mask_name}({mask:#x})");
+                    } else if st != -9 {
+                        println!("  {id_name} size={size} ver={ver} mask={mask_name}: st={st} (non -9!)");
+                    }
+                }
+            }
         }
-        let st = unsafe { NvAPI_GPU_ThermChannelGetControl(handle, buf.as_mut_ptr().cast()) } as i32;
-        if st == 0 {
-            accepted.push(size);
-        }
-        println!("  size={size}: st={st}");
     }
-    println!("accepted sizes: {accepted:?}");
+    println!("accepted: {accepted:?}");
+    if accepted.is_empty() {
+        println!("  (no variant accepted — control unreachable via 2-arg call on this driver)");
+    }
 
     // ---- ④ 被接受的最小形态全量 dump ----
-    if let Some(&sz) = accepted.first() {
-        println!("=== [T4] GetControl dump (size={sz}) ===");
+    if let Some(&(id_idx, sz, ver, mask)) = accepted.first() {
+        println!("=== [T4] control dump (id{} size={sz} ver={ver} mask={mask:#x}) ===", ids[id_idx].0);
+        let id_fn = ids[id_idx].1;
         let mut buf = vec![0u8; sz];
-        let ver: u32 = ((2u32) << 16) | (sz as u32 & 0xFFFF);
-        buf[0..4].copy_from_slice(&ver.to_le_bytes());
-        if sz >= 12 {
-            buf[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        let v: u32 = (ver << 16) | (sz as u32 & 0xFFFF);
+        buf[0..4].copy_from_slice(&v.to_le_bytes());
+        if sz >= 8 {
+            buf[4..8].copy_from_slice(&mask.to_le_bytes());
         }
-        let st = unsafe { NvAPI_GPU_ThermChannelGetControl(handle, buf.as_mut_ptr().cast()) } as i32;
+        let st = unsafe { id_fn(handle, buf.as_mut_ptr().cast()) } as i32;
         println!("status={st}");
         let nz = nonzero_dwords(&buf, usize::MAX);
         println!("nonzero dwords: {}", nz.len());
@@ -141,22 +163,5 @@ fn thermal_channel_probe() {
         }
     }
 
-    // ---- ⑤ ver=1 变体扫描（防版本字段不是 2）----
-    println!("=== [T5] GetControl size sweep (ver=(1<<16)|N) ===");
-    let mut accepted1 = Vec::new();
-    for size in [168usize, 296, 264, 424, 200, 232, 328] {
-        let mut buf = vec![0u8; size];
-        let ver: u32 = ((1u32) << 16) | (size as u32 & 0xFFFF);
-        buf[0..4].copy_from_slice(&ver.to_le_bytes());
-        if size >= 12 {
-            buf[4..8].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-        }
-        let st = unsafe { NvAPI_GPU_ThermChannelGetControl(handle, buf.as_mut_ptr().cast()) } as i32;
-        if st == 0 {
-            accepted1.push(size);
-        }
-        println!("  size={size}: st={st}");
-    }
-    println!("accepted (ver1): {accepted1:?}");
 
 }
