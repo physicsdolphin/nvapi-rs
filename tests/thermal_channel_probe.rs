@@ -149,6 +149,69 @@ fn thermal_channel_probe() {
             println!("  +{off:04X}: i32={sv} = Q8 {:.3} C", sv as f64 / 256.0);
         }
     }
+    // ---- ⑤b 活体轮询 diff（全 GET）：15s 高频轮询 control/info/status 三缓冲,
+    // 用户期间在 mVolt UI 改模拟值 → 变动的 dword = 真字段（mVolt 实际写的地方）。
+    println!("=== [T7] live poll-diff (15s): change mVolt GPU temp NOW ===");
+    {
+        use nvapi::sys::gpu::thermal::undocumented::{
+            NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2, NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2,
+        };
+        use nvapi::sys::api::{NvAPI_GPU_ThermChannelGetInfo, NvAPI_GPU_ThermChannelGetStatus};
+        let get_all = |mask: u32| -> (Vec<u8>, Vec<u8>, Vec<i32>) {
+            let mut ctrl = vec![0u8; 10444];
+            ctrl[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+            ctrl[8..12].copy_from_slice(&mask.to_le_bytes());
+            unsafe { NvAPI_GPU_ThermChannelGetControl(handle, ctrl.as_mut_ptr().cast()) };
+            let mut inf = NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2::default();
+            inf.version = nvapi::sys::nvapi::NvVersion::new(
+                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(), 2);
+            unsafe { NvAPI_GPU_ThermChannelGetInfo(handle, &mut inf) };
+            let mut st = NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2::default();
+            st.version = nvapi::sys::nvapi::NvVersion::new(
+                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2>(), 2);
+            st.channel_mask = mask;
+            unsafe { NvAPI_GPU_ThermChannelGetStatus(handle, &mut st) };
+            let stv: Vec<i32> = (0..32).filter(|i| mask & (1u32 << i) != 0)
+                .filter_map(|i| st.channel.get(i).copied()).collect();
+            // INFO raw bytes: walk the struct via pointer (params are repr(C) nvstruct)
+            let ibytes = unsafe {
+                core::slice::from_raw_parts(
+                    &inf as *const NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2 as *const u8,
+                    size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(),
+                )
+            }
+            .to_vec();
+            (ctrl, ibytes, stv)
+        };
+        let (c0, i0, s0) = get_all(channel_mask);
+        println!("  base captured: ctrl_nz={} info_nz={} status={s0:?}",
+            nonzero_dwords(&c0, usize::MAX).len(),
+            nonzero_dwords(&i0, usize::MAX).len());
+        for it in 1..=60usize {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let (c, i, sv) = get_all(channel_mask);
+            // control diff
+            for (off, (a, b)) in c0.chunks_exact(4).zip(c.chunks_exact(4)).enumerate() {
+                if a != b {
+                    println!("  [it{it}] CTRL +{off:04X}: {a:#010x} -> {b:#010x}");
+                }
+            }
+            // info diff
+            for (off, (a, b)) in i0.chunks_exact(4).zip(i.chunks_exact(4)).enumerate() {
+                if a != b {
+                    println!("  [it{it}] INFO +{off:04X}: {a:#010x} -> {b:#010x}");
+                }
+            }
+            // status diff
+            if sv != s0 {
+                println!("  [it{it}] STATUS: {s0:?} -> {sv:?}");
+            }
+            if it % 12 == 0 {
+                println!("  ... polling, ch temps: {sv:?}");
+            }
+        }
+        println!("  (poll done — any CTRL/INFO lines above = the fields mVolt actually writes)");
+    }
     // ---- ⑥ 写臂（双重门控）：温度 sim RMW + 还原验证
     if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
         let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
