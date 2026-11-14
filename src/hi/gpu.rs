@@ -1402,6 +1402,20 @@ impl Gpu {
         }
     }
 
+    /// Typed PerfVfeVar write — the mVolt+ "BIOS override" push lane
+    /// (PerfVfeVarSetControl 0x79FA23A2 with the snapshot→patch→SET→
+    /// converge→rollback protocol). Elevation-gated; consult
+    /// [`Self::vfe_var_info`] for entry semantics before writing.
+    /// Returns the previous dword value on success.
+    pub fn set_vfe_var_entry(
+        &self,
+        index: usize,
+        dword_off: usize,
+        value: u32,
+    ) -> crate::Result<u32> {
+        self.gpu.set_vfe_var_entry(index, dword_off, value)
+    }
+
     /// Batch physical clocks for many domains via the V3 MEASURE_FREQ
     /// (magic 0x30038) — one RM round-trip per sample instead of one per
     /// domain. Per-domain V1/V2 fallback when the driver rejects the batch

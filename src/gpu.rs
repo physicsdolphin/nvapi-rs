@@ -5779,6 +5779,106 @@ impl PhysicalGpu {
         Ok(())
     }
 
+    /// Typed PerfVfeVar write — the mVolt+ "BIOS override / experimental
+    /// voltage offsets" push lane (mVolt+ 0.50.13 `sub_14028AEF0` a4=1 →
+    /// `sub_14028C390` converge loop; IDs cracked 2026-11-14, see
+    /// docs/reverse-engineering/nvapi/mvolt-0.50.13-write-paths.md §7).
+    ///
+    /// Protocol (mVolt+ recipe): snapshot GET (same 0xFFFF seeding as
+    /// [`Self::vfe_var_control`]) → patch one dword of entry `index` →
+    /// SET the whole block → re-GET until the field reads back at the
+    /// target for **2 consecutive** polls (50 ms apart, ≤12 rounds) →
+    /// on any failure SET the untouched snapshot back and report
+    /// [`crate::Error::RetainMismatch`].
+    ///
+    /// `dword_off` indexes 4-byte words within the 88-byte record
+    /// (payload starts at +4; 0..21). Entry semantics are type-tagged per
+    /// the Var GetInfo directory — consult `vfe_var_info()` before writing;
+    /// the driver is the final validator and will refuse nonsense fields by
+    /// not retaining them.
+    pub fn set_vfe_var_entry(
+        &self,
+        index: usize,
+        dword_off: usize,
+        value: u32,
+    ) -> crate::Result<u32> {
+        trace!("gpu.set_vfe_var_entry({index}, dword {dword_off}, {value:#x})");
+        use crate::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
+        use clock::undocumented::{NV_PERF_VFE_VAR_CONTROL, vfe_var_control};
+
+        if index >= vfe_var_control::MAX_ENTRIES || dword_off >= vfe_var_control::STRIDE / 4 {
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                dword_off as i64,
+            )));
+        }
+
+        // snapshot GET — the buffer comes back in the driver-sanctioned shape
+        let mut buf = vec![0u8; vfe_var_control::SIZE];
+        buf[0..4].copy_from_slice(&vfe_var_control::MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&0xFFFF_u32.to_le_bytes());
+        let st = unsafe { NvAPI_GPU_PerfVfeVarGetControl(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_PerfVfeVarGetControl, st)
+            .map_err(crate::Error::from)?;
+        let snapshot = buf.clone();
+
+        let count =
+            unsafe { (&*buf.as_ptr().cast::<NV_PERF_VFE_VAR_CONTROL>()).count() }.unwrap_or(0);
+        if index >= count as usize {
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                index as i64,
+            )));
+        }
+
+        // patch the target dword (absolute offset = header + index*stride + word*4)
+        let abs = vfe_var_control::ENTRIES + index * vfe_var_control::STRIDE + dword_off * 4;
+        let old = u32::from_le_bytes(buf[abs..abs + 4].try_into().unwrap());
+        buf[abs..abs + 4].copy_from_slice(&value.to_le_bytes());
+
+        let readback = || -> Option<u32> {
+            let mut probe = vec![0u8; vfe_var_control::SIZE];
+            probe[0..4].copy_from_slice(&vfe_var_control::MAGIC.to_le_bytes());
+            probe[4..8].copy_from_slice(&0xFFFF_u32.to_le_bytes());
+            let st = unsafe { NvAPI_GPU_PerfVfeVarGetControl(self.0, probe.as_mut_ptr().cast()) };
+            if crate::status_result(sys::Api::NvAPI_GPU_PerfVfeVarGetControl, st).is_err() {
+                return None;
+            }
+            Some(u32::from_le_bytes(probe[abs..abs + 4].try_into().unwrap()))
+        };
+
+        // SET the patched block
+        let st = unsafe { NvAPI_GPU_PerfVfeVarSetControl(self.0, buf.as_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_PerfVfeVarSetControl, st)
+            .map_err(crate::Error::from)?;
+
+        // converge: mVolt requires 2 consecutive matching reads (50 ms, ≤12)
+        let mut consecutive = 0usize;
+        let mut retained = None;
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            match readback() {
+                Some(v) if v == value => {
+                    consecutive += 1;
+                    retained = Some(v);
+                    if consecutive >= 2 {
+                        return Ok(old);
+                    }
+                }
+                Some(v) => {
+                    consecutive = 0;
+                    retained = Some(v);
+                }
+                None => break,
+            }
+        }
+        // not retained — roll the snapshot back and report honestly
+        let _ = unsafe { NvAPI_GPU_PerfVfeVarSetControl(self.0, snapshot.as_ptr().cast()) };
+        Err(crate::Error::RetainMismatch {
+            what: "PerfVfeVar entry dword",
+            wrote: value as i32,
+            retained: retained.map(|v| v as i32).unwrap_or(-1),
+        })
+    }
+
     #[allow(unused_assignments)]
     pub fn power_usage<C: IntoIterator<Item = crate::clock::PowerTopologyChannelId>>(
         &self,
