@@ -907,6 +907,167 @@ fn vfe_v2_tier_probe() {
             println!("  ident@{base}: st={st} nz={richness} {}", recs.join(" "));
         }
     }
+    // ============ 第八轮(2026-11-15,第七轮判决后)============
+    // ⑦判决:round-4 几何跨代际成立(var0 单bit+身份 @104 type13/max127);
+    //   引擎活表 Var@136 / Equ@104,76B 步进 [type,min,max,value@44],
+    //   值集 {810000,900000,0,900..1100000,20000,700000,1200000,+r7/r9-r12};
+    //   墙值(1220/1020/625/635)不在 VFE 层;身份块 @100/176/252/328/404 的
+    //   响应内容位置未知;info 全掩码只回 2 条(掩码语义不同)。
+    // mVolt 模型:var_slot=4*rail+map[3,0,1,2] → NVVDD REL=var0(0..127 代际
+    //   稳定界,2070 SET var0=6250µV 影响活体电压实证)→ 5060 Ti 抬墙候选=var0。
+    // 本轮全 GET-only:①驱动版本 ②引擎表全字段(找 var 引用) ③身份块原始
+    //   偏移 ④选中 var 记录区全 dump ⑤info 19位掩码原始 dump。
+    println!(
+        "=== [V8-0] driver version: {:?} ===",
+        nvapi::driver_version()
+    );
+
+    // [V8-1] 引擎活表全字段 dump(Var@136 / Equ@104,76B 步进,各 16 条)——
+    // 记录内除 type/min/max/value 外的字段可能携带 var 索引引用
+    {
+        println!("=== [V8-1] engine live tables full-field dump (Var@136 / Equ@104, 76B x16) ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl};
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
+
+        let mut varb = vec![0u8; 40904];
+        varb[0..4].copy_from_slice(&171976u32.to_le_bytes());
+        for i in 0..25 {
+            varb[4 + i] = 0xFF;
+        }
+        varb[36..1060].copy_from_slice(&ident1024);
+        unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, varb.as_mut_ptr().cast()) };
+        let mut eqb = vec![0u8; 1410116];
+        eqb[0..4].copy_from_slice(&1410116u32.to_le_bytes());
+        eqb[4..1028].copy_from_slice(&ident1024);
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, eqb.as_mut_ptr().cast()) };
+
+        for (tag, buf, base) in [("Var", &varb, 136usize), ("Equ", &eqb, 104usize)] {
+            println!("  --- {tag} table @+{base} stride 76 ---");
+            for k in 0..16usize {
+                let r = base + 76 * k;
+                if r + 76 > buf.len() {
+                    break;
+                }
+                let mut fields = Vec::new();
+                for (i, w) in buf[r..r + 76].chunks_exact(4).enumerate() {
+                    let v = u32::from_le_bytes(w.try_into().unwrap());
+                    if v != 0 {
+                        let f = f32::from_le_bytes(v.to_le_bytes());
+                        fields.push(format!("+{:02X}:{v:#010x}(f32 {f:.3?})", i * 4));
+                    }
+                }
+                if !fields.is_empty() {
+                    println!("    r{k}@{r}: {}", fields.join(" "));
+                }
+            }
+        }
+    }
+
+    // [V8-2] 身份块 @100/176/252/328/404 原始非零偏移(第七轮只解析了 @136
+    // 记录区,漏了它们的内容位置)
+    {
+        println!("=== [V8-2] per-identity raw nonzero offsets ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl};
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        for base in [100usize, 176, 252, 328, 404] {
+            let end = (base + 1024).min(small.len());
+            let ident = small[base..end].to_vec();
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            for i in 0..25 {
+                req[4 + i] = 0xFF;
+            }
+            let n = ident.len().min(1024);
+            req[36..36 + n].copy_from_slice(&ident[..n]);
+            unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) };
+            let nz = nonzero_dwords(&req, usize::MAX);
+            let body: Vec<String> = nz
+                .iter()
+                .filter(|(off, _)| *off >= 36)
+                .take(24)
+                .map(|(off, v)| {
+                    let f = f32::from_le_bytes(v.to_le_bytes());
+                    format!("+{off:04X}:{v:#010x}(f32 {f:.3?})")
+                })
+                .collect();
+            println!("  ident@{base}: nz={} {}", nz.len(), body.join(" "));
+        }
+    }
+
+    // [V8-3] 选中 var 记录区全 dump(单 bit+身份):var0/var3/var45 —— 验证
+    // round-4 位置回填 + 是否带 value/applied
+    {
+        println!("=== [V8-3] selected-var record region dump (single-bit + identity) ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl};
+        let mut small = vec![0u8; 85016];
+        small[0..4].copy_from_slice(&85016u32.to_le_bytes());
+        for d in 0..8usize {
+            small[4 + 4 * d..8 + 4 * d].copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        unsafe { NvAPI_GPU_PerfVfeEquGetControl(handle, small.as_mut_ptr().cast()) };
+        let ident1024: Vec<u8> = small[0..1024].to_vec();
+        for idx in [0usize, 1, 2, 3, 4, 5, 6, 7, 45] {
+            let mut req = vec![0u8; 40904];
+            req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+            req[4 + idx / 8] = 1 << (idx % 8);
+            req[36..1060].copy_from_slice(&ident1024);
+            unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) };
+            let rec = 104 + 160 * idx;
+            let mut fields = Vec::new();
+            for (i, w) in req[rec..rec + 160].chunks_exact(4).enumerate() {
+                let v = u32::from_le_bytes(w.try_into().unwrap());
+                if v != 0 {
+                    let f = f32::from_le_bytes(v.to_le_bytes());
+                    fields.push(format!("+{:02X}:{v:#010x}(f32 {f:.3?})", i * 4));
+                }
+            }
+            println!(
+                "  var{idx} rec@{rec}: {}",
+                if fields.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    fields.join(" ")
+                }
+            );
+        }
+    }
+
+    // [V8-4] info 19 位掩码(0x7FFFF)原始 dump:条目基址非均匀(296/572/848/
+    // 884/1916),全前 8KB 非零列出找 name ID;另试 0x7FFFFFF(27 位)/0xFFFFFFFF
+    {
+        println!("=== [V8-4] Var GetInfo raw dump (masks 0x7FFFF / 0xFFFFF / 0x3FFFFFF) ===");
+        use nvapi::sys::api::NvAPI_GPU_PerfVfeVarGetInfo;
+        let size = 2856296usize;
+        for (label, mask_bytes) in [
+            ("0x7FFFF", vec![0xFFu8, 0xFF, 0x07]),
+            ("0xFFFFF", vec![0xFFu8, 0xFF, 0x0F]),
+            ("0x3FFFFFF", vec![0xFFu8, 0xFF, 0xFF, 0x03]),
+        ] {
+            let mut b = vec![0u8; size];
+            b[0..4].copy_from_slice(&3118440u32.to_le_bytes());
+            for (i, m) in mask_bytes.iter().enumerate() {
+                b[4 + i] = *m;
+            }
+            let st = unsafe { NvAPI_GPU_PerfVfeVarGetInfo(handle, b.as_mut_ptr().cast()) } as i32;
+            let nz = nonzero_dwords(&b, usize::MAX);
+            println!(
+                "  mask {label}: st={st} nz={} first24={:?}",
+                nz.len(),
+                &nz[..nz.len().min(24)]
+            );
+        }
+    }
     let _ = ptr::null_mut::<u8>();
     let _ = ptr::null_mut::<u8>();
 }
