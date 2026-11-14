@@ -252,7 +252,7 @@ fn thermal_channel_probe() {
         prime[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
         prime[8..12].copy_from_slice(&channel_mask.to_le_bytes());
         unsafe { f(handle, prime.as_mut_ptr().cast(), 10444) };
-        let orig = prime.clone();
+        let mut orig = prime.clone();
         let st_before = gpu.thermal_channel_status(channel_mask);
         println!("  [before] status ch{ch} = {:?}", st_before.as_ref().ok().and_then(|s| s.get(ch)));
         // 值：entry_ch + 84（绝对）
