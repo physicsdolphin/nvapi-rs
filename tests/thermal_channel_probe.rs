@@ -216,6 +216,53 @@ fn thermal_channel_probe() {
         }
         println!("  (poll done — any CTRL/INFO lines above = the fields mVolt actually writes)");
     }
+    // ---- ②c 真 marker 协议（sub_140219C90 破译）：
+    //   GetControl(handle, buf10444, 0x13579BDF)  /  SetControl(handle, buf, 0x2468ACE0)
+    //   SET 载荷 = 124B ver1（头 4B + 六条 20B 记录 @4+20k：
+    //   ch_class@+0 / applied@+4 / sim_q8@+8 / state_dword@+12 / WORD1@+16）。
+    println!("=== [T3c] true-marker GET (0x13579BDF) ===");
+    let getm = |marker: usize| -> (i32, Vec<u8>) {
+        let f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => return (-9, Vec::new()),
+        };
+        let mut b = vec![0u8; 10444];
+        b[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+        b[8..12].copy_from_slice(&channel_mask.to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), marker) } as i32;
+        (st, b)
+    };
+    let (stm, bufm) = getm(0x13579BDF);
+    println!("  GET marker=0x13579BDF: st={stm}");
+    if stm == 0 {
+        let nz = nonzero_dwords(&bufm, usize::MAX);
+        println!("  nonzero dwords: {}", nz.len());
+        for (off, v) in nz.iter().take(40) {
+            let f = f32::from_le_bytes(v.to_le_bytes());
+            println!("  +{off:04X}: {v:#010x} (f32 {f})");
+        }
+    }
+    {
+        let f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => {
+                println!("  SetControl-id: QueryInterface FAILED");
+                return;
+            }
+        };
+        let mut b = vec![0u8; 10444];
+        b[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+        b[8..12].copy_from_slice(&channel_mask.to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), 0x13579BDF) } as i32;
+        println!("  SetControl-id as GET marker=0x13579BDF: st={st}");
+    }
+
     // ---- ⑥ 写臂（双重门控）：完整配方 = 值(entry_k+84) + 使能标志字节(47/101/128) + RMW + 全缓冲还原
     // 依据：T7 活体 diff（mVolt apply 时 CTRL +0x2F/+0x65/+0x80 置 1 + Status ch1 钉 1280=5°C）。
     if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
