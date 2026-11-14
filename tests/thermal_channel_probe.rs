@@ -127,23 +127,6 @@ fn thermal_channel_probe() {
     let (st_c, _buf_c) = get_ctrl(0x8DF19FA2, 0xFFFF);
     println!("  SetControl-id as GET (0x8DF19FA2) mask=0xFFFF: st={st_c}");
 
-    // 贿缝探限：ver/len 变体
-    for (ver_try, len_try) in [(0x000228CCu32, 0x28CCusize), (0x000328CC, 0x2000usize)] {
-        if let Ok(p) = nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
-            if !p.is_null() {
-                let f = unsafe {
-                    core::mem::transmute::<*mut core::ffi::c_void,
-                        unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
-                };
-                let mut b = vec![0u8; len_try];
-                b[0..4].copy_from_slice(&ver_try.to_le_bytes());
-                b[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
-                let st = unsafe { f(handle, b.as_mut_ptr().cast(), len_try) } as i32;
-                println!("  probe ver={ver_try:#x} len={len_try}: st={st}");
-            }
-        }
-    }
-
     // ---- ③ 控制态 dump ----
     let (best_st, best_buf, best_tag) = if st_a == 0 {
         (st_a, &buf_a, "mask=0xFFFF")
