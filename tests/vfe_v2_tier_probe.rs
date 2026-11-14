@@ -316,6 +316,76 @@ fn vfe_v2_tier_probe() {
         walls("after");
     }
 
+    // ⚠️⚠️⚠️ 危险——本臂已实机造成内核死锁(2026-11-14,黑屏卡死无 TDR):
+    // 19 变量连续 applied=1 微扰 → 驱动真实消费(SET 保留已实证) → VFE 策略
+    // 引擎死锁,死锁级别低于 TDR 看门狗,只能重启恢复。**禁止再运行**。
+    // 语义映射必须走 RE 路线(Equ 表结构分析/mVolt 流复刻),禁止盲扰。
+    // 语义映射扫描(NVOC_ALLOW_VFE_WRITE=1):19 个 var 逐个 +6250µV 微扰 →
+    // volt_rails 六值 diff → 还原 → 复核。产出 var→墙 语义映射。
+    if std::env::var("NVOC_ALLOW_VFE_WRITE").is_ok() {
+        println!("=== Var semantics sweep (19 vars, +6250uV perturbation) ===");
+        use nvapi::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
+        let rails_now = |tag: &str| -> Option<[i32; 6]> {
+            let r = gpu.volt_rails().ok()?;
+            let s = r.status.first()?.values;
+            println!("  [{tag}] status: {s:?}");
+            Some(s)
+        };
+        let before = rails_now("baseline");
+        let populated: Vec<usize> = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ]
+        .to_vec();
+        for &idx in &populated {
+            let single_get = |i: usize| -> Vec<u8> {
+                let mut req = vec![0u8; 40904];
+                req[0..4].copy_from_slice(&171976u32.to_le_bytes());
+                req[4 + i / 8] = 1 << (i % 8);
+                unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, req.as_mut_ptr().cast()) };
+                req
+            };
+            let factory = single_get(idx);
+            let rec = 104 + 160 * idx;
+            // 工厂值读取(若 value/min/max 已有值,微扰叠加)
+            let f_val = f32::from_le_bytes(factory[rec + 48..rec + 52].try_into().unwrap());
+            let perturb = if f_val == 0.0 {
+                6250.0f32
+            } else {
+                f_val + 6250.0
+            };
+            let mut req = factory.clone();
+            for x in req[4..36].iter_mut() {
+                *x = 0;
+            }
+            req[4 + idx / 8] = 1 << (idx % 8);
+            req[rec + 4..rec + 8].copy_from_slice(&perturb.min(0.0).to_le_bytes());
+            req[rec + 8..rec + 12].copy_from_slice(&perturb.max(0.0).to_le_bytes());
+            req[rec + 44] = 1;
+            req[rec + 48..rec + 52].copy_from_slice(&perturb.to_le_bytes());
+            let st_set =
+                unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let after_w = rails_now(&format!("var{idx}=+{perturb}"));
+            // 还原
+            unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, factory.as_ptr().cast()) };
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let _ = st_set;
+            if let (Some(b), Some(a)) = (before, after_w) {
+                let moved: Vec<String> = b
+                    .iter()
+                    .zip(a.iter())
+                    .enumerate()
+                    .filter(|(_, (x, y))| x != y)
+                    .map(|(i, (x, y))| format!("s{i}:{x}->{y}"))
+                    .collect();
+                if !moved.is_empty() {
+                    println!("    *** var{idx} MOVED: {} ***", moved.join(" "));
+                }
+            }
+        }
+        rails_now("final");
+    }
+
     // 身份自举实验:小戳 EquGetControl(85016)raw 响应中找非零区块 →
     // 候选 1024B/32B 切片回喂 V2 GET → 量丰富度。
     {
