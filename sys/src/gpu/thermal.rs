@@ -544,6 +544,33 @@ pub mod undocumented {
     }
 
     // ------------------------------------------------------------------
+    // Thermal Channel CONTROL (the writable half of the ThermChannel family;
+    // IDs 0xa933ce98 = GetControl / 0x8df19fa2 = SetControl). Confirmed in
+    // the wild via mVolt+ 0.50.13: its Thermal inputs panel (per-channel
+    // temperature reading offsets + include toggles, LN2 workflow) drives
+    // this pair and WORKS on RTX 5060 Ti / 621.24 — the same driver where
+    // the PerfVFE voltage-override lane is retained-but-never-consumed.
+    // Control layout is NOT yet RE'd (probe: tests/thermal_channel_probe.rs
+    // sweeps GetControl version stamps); FFI is declared with opaque
+    // pointers until the struct lands.
+    // ------------------------------------------------------------------
+
+    nvapi! {
+        /// Undocumented (NDA-private, ID 0xa933ce98). Thermal-channel control
+        /// state read (the read half of the offset RMW). Layout pending —
+        /// declared opaque; see `thermal_channel_probe.rs` for the stamp sweep.
+        pub unsafe fn NvAPI_GPU_ThermChannelGetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut core::ffi::c_void) -> NvAPI_Status;
+    }
+
+    nvapi! {
+        /// Undocumented (NDA-private, ID 0x8df19fa2). Thermal-channel control
+        /// write — per-channel temperature reading offsets (the mVolt+
+        /// "Thermal inputs" lane; live-confirmed on 5060 Ti / 621.24). Layout
+        /// pending — declared opaque; RMW from a GetControl prime.
+        pub unsafe fn NvAPI_GPU_ThermChannelSetControl(hPhysicalGPU: NvPhysicalGpuHandle, pControl: *mut core::ffi::c_void) -> NvAPI_Status;
+    }
+
+    // ------------------------------------------------------------------
     // Mobile GPU target-temperature wall ("targettemp" / 温度墙) — the PRIVATE
     // ClientThermalPolicies RMW pair, RE'd from the ref-tool CLI.
     //
