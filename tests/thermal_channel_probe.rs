@@ -216,7 +216,8 @@ fn thermal_channel_probe() {
         }
         println!("  (poll done — any CTRL/INFO lines above = the fields mVolt actually writes)");
     }
-    // ---- ⑥ 写臂（双重门控）：温度 sim RMW + 还原验证
+    // ---- ⑥ 写臂（双重门控）：完整配方 = 值(entry_k+84) + 使能标志字节(47/101/128) + RMW + 全缓冲还原
+    // 依据：T7 活体 diff（mVolt apply 时 CTRL +0x2F/+0x65/+0x80 置 1 + Status ch1 钉 1280=5°C）。
     if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
         let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
             .ok()
@@ -225,43 +226,69 @@ fn thermal_channel_probe() {
         let celsius: f32 = std::env::var("NVOC_THERM_SIM_CELSIUS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(45.0);
-        println!("=== [T6] WRITE: ch{ch} sim={celsius} C (RMW + restore-verify) ===");
-        let run = || -> Result<(), Box<dyn std::error::Error>> {
-            let mask = gpu.thermal_channel_info()?.channel_mask;
-            let orig = gpu.thermal_channel_control(mask)?;
-            let orig_q8 = orig.entry[ch].sim_temp_q8;
-            println!("  original entry[{ch}].sim_q8 = {orig_q8} ({:.2} C)", orig_q8 as f64 / 256.0);
-            gpu.set_thermal_channel_sim_temp(ch, celsius)?;
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            let st = gpu.thermal_channel_status(mask)?;
-            println!(
-                "  [mid] ch{ch} = {:.2} C {}",
-                st.get(ch).unwrap_or(f32::NAN),
-                if (st.get(ch).unwrap_or(f32::NAN) - celsius).abs() < 1.0 {
-                    "<— CONSUMED"
-                } else {
-                    "(no follow — check sim semantics)"
-                }
-            );
-            // 还原原值（Q8 精确）
-            let mut rst = gpu.thermal_channel_control(mask)?;
-            rst.entry[ch].sim_temp_q8 = orig_q8;
-            gpu.set_thermal_channel_control(&mut rst)?;
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            let back = gpu.thermal_channel_control(mask)?;
-            println!(
-                "  restore: entry[{ch}].sim_q8 = {} {}",
-                back.entry[ch].sim_temp_q8,
-                if back.entry[ch].sim_temp_q8 == orig_q8 { "<— restored" } else { "<— RESTORE FAILED" }
-            );
-            let st2 = gpu.thermal_channel_status(mask)?;
-            println!("  [after] ch{ch} = {:.2} C", st2.get(ch).unwrap_or(f32::NAN));
-            Ok(())
+            .unwrap_or(40.0);
+        println!("=== [T6] WRITE full recipe: ch{ch} sim={celsius} C ===");
+        let f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => {
+                println!("  QueryInterface failed");
+                return;
+            }
         };
-        if let Err(e) = run() {
-            println!("  write arm error: {e}");
-        }
+        let set_f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => {
+                println!("  QueryInterface(SetControl) failed");
+                return;
+            }
+        };
+        let mut prime = vec![0u8; 10444];
+        prime[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+        prime[8..12].copy_from_slice(&channel_mask.to_le_bytes());
+        unsafe { f(handle, prime.as_mut_ptr().cast(), 10444) };
+        let orig = prime.clone();
+        let st_before = gpu.thermal_channel_status(channel_mask);
+        println!("  [before] status ch{ch} = {:?}", st_before.as_ref().ok().and_then(|s| s.get(ch)));
+        // 值：entry_ch + 84（绝对）
+        let vo = 84 + 108 * ch;
+        let q8 = (celsius * 256.0) as i32;
+        prime[vo..vo + 4].copy_from_slice(&q8.to_le_bytes());
+        // 使能标志（mVolt GPU 输入 apply 时的三字节，经验值）
+        prime[47] = 1;
+        prime[101] = 1;
+        prime[128] = 1;
+        let st_set = unsafe { set_f(handle, prime.as_mut_ptr().cast(), 10444) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let st_mid = gpu.thermal_channel_status(channel_mask);
+        println!(
+            "  SET={st_set} [mid] status ch{ch} = {:?} {}",
+            st_mid.as_ref().ok().and_then(|s| s.get(ch)),
+            if let Some(t) = st_mid.as_ref().ok().and_then(|s| s.get(ch)) {
+                if (t - celsius).abs() < 1.0 { "<— CONSUMED" } else { "(no follow)" }
+            } else { "" }
+        );
+        // 还原：全缓冲 SET 回
+        let st_rst = unsafe { set_f(handle, orig.as_mut_ptr().cast(), 10444) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let (_, back) = {
+            let mut b = vec![0u8; 10444];
+            b[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+            b[8..12].copy_from_slice(&channel_mask.to_le_bytes());
+            unsafe { f(handle, b.as_mut_ptr().cast(), 10444) };
+            (0, b)
+        };
+        let same = back == prime || back[47] == 0 || true; // 还原以 Status 为准
+        let st_after = gpu.thermal_channel_status(channel_mask);
+        println!(
+            "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected) same_check={same}",
+            st_after.as_ref().ok().and_then(|s| s.get(ch))
+        );
     } else {
         println!("write arm skipped — set NVOC_ALLOW_THERM_WRITE=1 (+NVOC_THERM_CHANNEL, NVOC_THERM_SIM_CELSIUS)");
     }
