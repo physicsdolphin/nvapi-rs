@@ -101,127 +101,69 @@ fn thermal_channel_probe() {
         }
         Err(e) => println!("GetStatus failed: {e:?}"),
     }
-    // ---- ③ GetControl 扫描 v2：掩码感知（真实 mask / 单 bit / 0）× 两 ID × ver 1/2
-    // 上一轮全 -9 的首要嫌疑=掩码硬编 0xFFFFFFFF（含未充填通道位，仿 VFE 全掩码拒绝模式）。
-    println!("=== [T3] Control sweep: ids x masks x ver x sizes ===");
-    type ControlFn = unsafe fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void) -> nvapi::sys::NvAPI_Status;
-    let ids: [(&str, ControlFn); 2] = [
-        ("GetControl 0xA933CE98", NvAPI_GPU_ThermChannelGetControl),
-        ("SetControl 0x8DF19FA2", NvAPI_GPU_ThermChannelSetControl),
-    ];
-    let masks: [(u32, &str); 4] = [
-        (channel_mask, "info-mask"),
-        (0, "zero"),
-        (1, "bit0"),
-        (0x1cfff, "0x1cfff"),
-    ];
-    let sizes = [168usize, 232, 264, 296, 328, 360, 392, 424, 456, 488, 520, 1048, 72, 104, 136, 200, 8, 40, 56, 88, 120, 152, 184, 216, 248, 280, 312, 344, 376, 408, 440, 472, 504];
-    let mut accepted: Vec<(usize, usize, u32, u32)> = Vec::new(); // (id_idx, size, ver, mask)
-    for (id_idx, (id_name, id_fn)) in ids.iter().enumerate() {
-        for (mask, mask_name) in masks {
-            for ver in [2u32, 1u32] {
-                for size in sizes {
-                    let mut buf = vec![0u8; size];
-                    let v: u32 = (ver << 16) | (size as u32 & 0xFFFF);
-                    buf[0..4].copy_from_slice(&v.to_le_bytes());
-                    if size >= 8 {
-                        buf[4..8].copy_from_slice(&mask.to_le_bytes());
-                    }
-                    let st = unsafe { id_fn(handle, buf.as_mut_ptr().cast()) } as i32;
-                    if st == 0 {
-                        accepted.push((id_idx, size, ver, mask));
-                        println!("  HIT {id_name} size={size} ver={ver} mask={mask_name}({mask:#x})");
-                    } else if st != -9 {
-                        println!("  {id_name} size={size} ver={ver} mask={mask_name}: st={st} (non -9!)");
-                    }
-                }
-            }
-        }
-    }
-    println!("accepted: {accepted:?}");
-    if accepted.is_empty() {
-        println!("  (no variant accepted — control unreachable via 2-arg call on this driver)");
-    }
-
-    // ---- ③b 3 参签名扫描（Marker 假说）：QueryInterface 拿裸指针，
-    // 按 (handle, buf, marker: usize) 调。MarkerFirst/Second 名字强烈暗示同一
-    // 接口按 marker 分调用模式。2 参错位时驱动返回 NOT_SUPPORTED 与全 -9 吻合。
-    println!("=== [T3b] 3-arg sweep (handle, buf, marker) x ids x masks x ver x sizes ===");
-    let qif = |id: u32| -> Option<unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status> {
-        match nvapi::sys::nvapi_QueryInterface(id) {
-            Ok(p) if !p.is_null() => Some(unsafe { core::mem::transmute(p) }),
-            _ => None,
-        }
-    };
-    let raw_ids = [(0xA933CE98u32, "GetControl-id"), (0x8DF19FA2, "SetControl-id")];
-    let mut accepted3: Vec<(u32, usize, u32, u32, usize)> = Vec::new(); // (id, size, ver, mask, marker)
-    for (id, id_name) in raw_ids {
-        let Some(f) = qif(id) else {
-            println!("  {id_name}: QueryInterface FAILED (id unresolved)");
-            continue;
+    // ---- ② GetControl 精确形态（mVolt 0x1400137FC 调用区复刻）----
+    // 签名 (handle, buf, len)；buf 10444B，ver=(3<<16)|0x28CC=0x328CC，掩码@+8=0xFFFF。
+    println!("=== [T3] GetControl exact shape (len=10444, ver=0x328CC) ===");
+    let len = 0x28CCusize;
+    let ver: u32 = 0x000328CC;
+    let get_ctrl = |id: u32, mask: u32| -> (i32, Vec<u8>) {
+        let f = match nvapi::sys::nvapi_QueryInterface(id) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => return (-9, Vec::new()),
         };
-        println!("  {id_name}: QueryInterface OK");
-        for (mask, mask_name) in masks {
-            for ver in [2u32, 1u32] {
-                for size in sizes {
-                    for marker in [0usize, 1, 2] {
-                        let mut buf = vec![0u8; size];
-                        let v: u32 = (ver << 16) | (size as u32 & 0xFFFF);
-                        buf[0..4].copy_from_slice(&v.to_le_bytes());
-                        if size >= 8 {
-                            buf[4..8].copy_from_slice(&mask.to_le_bytes());
-                        }
-                        let st = unsafe { f(handle, buf.as_mut_ptr().cast(), marker) } as i32;
-                        if st == 0 {
-                            accepted3.push((id, size, ver, mask, marker));
-                            println!("  HIT {id_name} size={size} ver={ver} mask={mask_name} marker={marker}");
-                        } else if st != -9 {
-                            println!("  {id_name} size={size} ver={ver} mask={mask_name} marker={marker}: st={st}");
-                        }
-                    }
-                }
+        let mut b = vec![0u8; len];
+        b[0..4].copy_from_slice(&ver.to_le_bytes());
+        b[8..12].copy_from_slice(&mask.to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), len) } as i32;
+        (st, b)
+    };
+    let (st_a, buf_a) = get_ctrl(0xA933CE98, 0xFFFF);
+    println!("  GetControl(0xA933CE98) mask=0xFFFF: st={st_a}");
+    let (st_b, buf_b) = get_ctrl(0xA933CE98, channel_mask);
+    println!("  GetControl(0xA933CE98) mask={channel_mask:#x}: st={st_b}");
+    let (st_c, _buf_c) = get_ctrl(0x8DF19FA2, 0xFFFF);
+    println!("  SetControl-id as GET (0x8DF19FA2) mask=0xFFFF: st={st_c}");
+
+    // 贿缝探限：ver/len 变体
+    for (ver_try, len_try) in [(0x000228CCu32, 0x28CCusize), (0x000328CC, 0x2000usize)] {
+        if let Ok(p) = nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
+            if !p.is_null() {
+                let f = unsafe {
+                    core::mem::transmute::<*mut core::ffi::c_void,
+                        unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                };
+                let mut b = vec![0u8; len_try];
+                b[0..4].copy_from_slice(&ver_try.to_le_bytes());
+                b[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
+                let st = unsafe { f(handle, b.as_mut_ptr().cast(), len_try) } as i32;
+                println!("  probe ver={ver_try:#x} len={len_try}: st={st}");
             }
         }
     }
-    println!("accepted3: {accepted3:?}");
-    if let Some(&(id, sz, ver, mask, marker)) = accepted3.first() {
-        println!("=== [T4b] 3-arg control dump (id={id:#x} size={sz} ver={ver} mask={mask:#x} marker={marker}) ===");
-        let f = qif(id).unwrap();
-        let mut buf = vec![0u8; sz];
-        let v: u32 = (ver << 16) | (sz as u32 & 0xFFFF);
-        buf[0..4].copy_from_slice(&v.to_le_bytes());
-        if sz >= 8 {
-            buf[4..8].copy_from_slice(&mask.to_le_bytes());
-        }
-        let st = unsafe { f(handle, buf.as_mut_ptr().cast(), marker) } as i32;
-        println!("status={st}");
-        let nz = nonzero_dwords(&buf, usize::MAX);
-        println!("nonzero dwords: {}", nz.len());
-        for (off, v) in nz.iter().take(80) {
-            let f32v = f32::from_le_bytes(v.to_le_bytes());
-            println!("  +{off:04X}: {v:#010x} (f32 {f32v})");
+
+    // ---- ③ 控制态 dump ----
+    let (best_st, best_buf, best_tag) = if st_a == 0 {
+        (st_a, &buf_a, "mask=0xFFFF")
+    } else if st_b == 0 {
+        (st_b, &buf_b, "mask=info")
+    } else {
+        (st_a, &buf_a, "mask=0xFFFF (refused)")
+    };
+    println!("=== [T4] control dump ({best_tag}) st={best_st} ===");
+    let nz = nonzero_dwords(best_buf, usize::MAX);
+    println!("nonzero dwords: {}", nz.len());
+    for (off, v) in nz.iter().take(120) {
+        let f = f32::from_le_bytes(v.to_le_bytes());
+        println!("  +{off:04X}: {v:#010x} (f32 {f})");
+    }
+    println!("  --- Q8 candidates (i32 |v|<200000, v%4==0, !=0) ---");
+    for (off, v) in nz.iter() {
+        let sv = *v as i32;
+        if sv.abs() < 200000 && sv % 4 == 0 {
+            println!("  +{off:04X}: i32={sv} = Q8 {:.3} C", sv as f64 / 256.0);
         }
     }
-
-    // ---- ④ 被接受的最小形态全量 dump ----
-    if let Some(&(id_idx, sz, ver, mask)) = accepted.first() {
-        println!("=== [T4] control dump (id{} size={sz} ver={ver} mask={mask:#x}) ===", ids[id_idx].0);
-        let id_fn = ids[id_idx].1;
-        let mut buf = vec![0u8; sz];
-        let v: u32 = (ver << 16) | (sz as u32 & 0xFFFF);
-        buf[0..4].copy_from_slice(&v.to_le_bytes());
-        if sz >= 8 {
-            buf[4..8].copy_from_slice(&mask.to_le_bytes());
-        }
-        let st = unsafe { id_fn(handle, buf.as_mut_ptr().cast()) } as i32;
-        println!("status={st}");
-        let nz = nonzero_dwords(&buf, usize::MAX);
-        println!("nonzero dwords: {}", nz.len());
-        for (off, v) in nz.iter().take(80) {
-            let f = f32::from_le_bytes(v.to_le_bytes());
-            println!("  +{off:04X}: {v:#010x} (f32 {f})");
-        }
-    }
-
-
 }
