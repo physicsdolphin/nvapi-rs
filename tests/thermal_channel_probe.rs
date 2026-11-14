@@ -336,7 +336,94 @@ fn thermal_channel_probe() {
             "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected) same_check={same}",
             st_after.as_ref().ok().and_then(|s| s.get(ch))
         );
+    if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
+        // ---- ⑦c 真-marker SetControl：124B ver1 载荷（六条 20B 记录）
+        // 来自 sub_140219C90 的 v42 模板：ver=(1<<16)|256，六条记录 @4+20k：
+        //   ch_class@0 / applied@4 / sim_q8@8 / state_dword@12 / WORD1@16
+        // 通道映射 dword_1403746B0=[1,3,4,5,2,0]（输入 0..5 → 驱动通道）。
+        println!("=== [T6c] true-marker SetControl 124B payload ===");
+        let setm = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => {
+                println!("  QueryInterface(SetControl) FAILED");
+                return;
+            }
+        };
+        let getm_f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void,
+                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+            },
+            _ => {
+                println!("  QueryInterface(GetControl) FAILED");
+                return;
+            }
+        };
+        // 真-marker GET 读运行态（每通道 applied 旗 + 现值）
+        let mut live = vec![0u8; 10444];
+        live[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+        live[8..12].copy_from_slice(&channel_mask.to_le_bytes());
+        unsafe { getm_f(handle, live.as_mut_ptr().cast(), 0x13579BDF) };
+        // 构建 124B 载荷：从运行态拷每通道的 ch_class/applied/state，换目标通道的 sim
+        let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let celsius: f32 = std::env::var("NVOC_THERM_SIM_CELSIUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(45.0);
+        let map = [1usize, 3, 4, 5, 2, 0]; // 输入 0..5 → 驱动通道
+        let mut payload = vec![0u8; 124];
+        payload[0..2].copy_from_slice(&256u16.to_le_bytes()); // ver (1<<16)|256 低 16B
+        payload[2] = 1; // ver high byte
+        // 六条记录 @ 4+20k，k=输入序；记录 = {ch_class@0, applied@4, sim_q8@8, state@12, WORD1@16}
+        for (inp, &drv_ch) in map.iter().enumerate() {
+            let r = 4 + 20 * inp;
+            // ch_class 从运行态 entry(drv_ch)+0 取
+            let cc = u32::from_le_bytes(live[76 + 108 * drv_ch..76 + 108 * drv_ch + 4].try_into().unwrap());
+            payload[r..r + 4].copy_from_slice(&cc.to_le_bytes());
+            payload[r + 4..r + 8].copy_from_slice(&1u32.to_le_bytes()); // applied=1
+            if drv_ch == ch {
+                let q8 = (celsius * 256.0) as i32;
+                payload[r + 8..r + 12].copy_from_slice(&q8.to_le_bytes());
+                println!("  input{inp} -> ch{drv_ch}: sim={celsius} C (q8={q8})");
+            } else {
+                let sv = i32::from_le_bytes(live[76 + 108 * drv_ch + 8..76 + 108 * drv_ch + 12].try_into().unwrap());
+                payload[r + 8..r + 12].copy_from_slice(&sv.to_le_bytes());
+            }
+            payload[r + 12..r + 16].copy_from_slice(&0u32.to_le_bytes()); // state=0 (follow)
+            payload[r + 16..r + 18].copy_from_slice(&1u16.to_le_bytes()); // WORD1
+        }
+        let st_set = unsafe { setm(handle, payload.as_mut_ptr().cast(), 0x2468ACE0) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let st_now = gpu.thermal_channel_status(channel_mask);
+        println!(
+            "  SET={st_set} [mid] status ch{ch} = {:?} {}",
+            st_now.as_ref().ok().and_then(|s| s.get(ch)),
+            if let Some(t) = st_now.as_ref().ok().and_then(|s| s.get(ch)) {
+                if (t - celsius).abs() < 1.5 { "<— CONSUMED" } else { "(no follow — payload semantics need refinement)" }
+            } else { "" }
+        );
+        // 还原：清目标通道 sim（重建载荷 sim=0）+ SET
+        let q0 = 0i32;
+        for (inp, &drv_ch) in map.iter().enumerate() {
+            if drv_ch == ch {
+                let r = 4 + 20 * inp;
+                payload[r + 8..r + 12].copy_from_slice(&q0.to_le_bytes());
+            }
+        }
+        let st_rst = unsafe { setm(handle, payload.as_mut_ptr().cast(), 0x2468ACE0) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let st_after = gpu.thermal_channel_status(channel_mask);
+        println!(
+            "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected)",
+            st_after.as_ref().ok().and_then(|s| s.get(ch))
+        );
     } else {
         println!("write arm skipped — set NVOC_ALLOW_THERM_WRITE=1 (+NVOC_THERM_CHANNEL, NVOC_THERM_SIM_CELSIUS)");
     }
-}
+}}
