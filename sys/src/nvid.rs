@@ -3032,3 +3032,30 @@ Unknown_7B9681DA = 0x7b9681da,
     NvAPI_PCF_CpuIntelTurboRatioGetControl = 0xbcb11611,
     NvAPI_PCF_DynamicBoostGetStatus = 0xc80068a1,
 }
+
+/// Internal nvapi64_impl constants — NOT QueryInterface-resolvable IDs (these
+/// live below the interface-table layer and are absent from every public ID
+/// list; documented from the mVolt+ 0.50.13 RE + nvapi64_impl.dll 621.x
+/// static analysis, 2026-11).
+///
+/// Architecture context (IDA-verified): nvapi64.dll is a SHIM — its static
+/// QueryInterface table holds only 4 stubs and everything else falls back to
+/// `nvapi64_impl.dll` (driver store, `nv_dispi.inf` package), where interface
+/// IDs are stored in PLAINTEXT. Any ID in nvapi64_impl's table is therefore
+/// callable through the shim's fallback even if unknown to public lists.
+pub mod internal {
+    /// Direct-method selector passed as the FIRST argument to nvapi64_impl's
+    /// internal transport (the fn mVolt+ 0.50.13 derives by pattern inside the
+    /// `0xC4554575` TARGET-GET handler). NOT a QueryInterface ID — QI rejects
+    /// it. The routing buffer carries the actual RM control command at +0x34.
+    pub const NVAPI_DIRECT_METHOD_THERMAL_POLICY: u32 = 0x0700_002F;
+
+    /// RM control command served by the thermal-policy lane: the compact
+    /// per-slot STATUS readout (32B header + 16×88B entries: identity/temp-Q8/
+    /// PFF region + bRemoveTdpLimit byte @entry+84). mVolt+ writes it into its
+    /// request buffer at +0x34; the impl's TARGET-GET handler builds the same
+    /// command for its own (much larger, 0x12B38-byte) request. Present since
+    /// at least the 621 generation; absent from the 472-era monolithic
+    /// nvapi64.dll.
+    pub const NVAPI_RM_CONTROL_THERMAL_POLICY_STATUS: u32 = 0x2080_852C;
+}
