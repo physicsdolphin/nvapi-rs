@@ -1078,6 +1078,141 @@ fn thermal_channel_probe() {
         );
     }
 
+    // ---- ⑦T13: bRemoveTdpLimit 旗位猎取（mobile 车道 A/B）----
+    // 判决问题：documented STATUS 的 remove_tdp_limit 翻转时，PRIVATE TARGET
+    // v2|984 缓冲里哪个 dword 跟动（=旗位）。dev 机静态扫描（RemoveTdpLimit=yes
+    // 武装态）无独立候选：TARGET 非零 dword 只有 d1=4/d2=cur Q8/d3=0xC8/
+    // d8=0xffff0103/d9=0xff00/quad——d8 与 4060L/5060Ti 历史值相同，不随状态变。
+    // 前提：documented SetStatus(0x34C0B13D) 可持久（4060L 可用；50 系桌面拒，
+    // 本臂会报 SET 错误并跳过 diff）。门控：NVOC_ALLOW_TDP_FLAG_WRITE=1。
+    if std::env::var("NVOC_ALLOW_TDP_FLAG_WRITE").is_ok() {
+        println!(
+            "=== [T13] remove_tdp_limit flag hunt: documented SetStatus flip + TARGET A/B diff ==="
+        );
+        't13: {
+            let Some(mut s0) = status0.clone() else {
+                println!("  skip: documented STATUS unavailable");
+                break 't13;
+            };
+            let count = u32::from_le_bytes(s0[4..8].try_into().unwrap());
+            if count == 0 {
+                println!("  skip: no armed policies (count=0) — nothing to flip");
+                break 't13;
+            }
+            let resolve = |id: u32| -> Option<
+                unsafe extern "C" fn(
+                    nvapi::sys::handles::NvPhysicalGpuHandle,
+                    *mut core::ffi::c_void,
+                    usize,
+                ) -> nvapi::sys::NvAPI_Status,
+            > {
+                let f = nvapi::sys::nvapi_QueryInterface(id).ok()?;
+                if f.is_null() {
+                    return None;
+                }
+                Some(unsafe {
+                    core::mem::transmute::<
+                        *mut core::ffi::c_void,
+                        unsafe extern "C" fn(
+                            nvapi::sys::handles::NvPhysicalGpuHandle,
+                            *mut core::ffi::c_void,
+                            usize,
+                        ) -> nvapi::sys::NvAPI_Status,
+                    >(f)
+                })
+            };
+            let Some(get_f) = resolve(0xC4554575) else {
+                println!("  QueryInterface(TARGET GET-prime) FAILED");
+                break 't13;
+            };
+            let Some(set_pol_f) = resolve(0x34C0B13D) else {
+                println!("  QueryInterface(documented SetStatus) FAILED");
+                break 't13;
+            };
+            // 全 16 槽 TARGET 复合视图：mask=1<<i 逐槽 GET，整缓冲快照。
+            // 未 populated 的槽 GET 会拒（-1）——记 None，diff 时跳过。
+            let dump_all = || -> Vec<Option<Vec<u8>>> {
+                (0..16usize)
+                    .map(|i| {
+                        let mut b = vec![0u8; 984];
+                        b[0..4].copy_from_slice(&0x0002_03D8u32.to_le_bytes());
+                        b[4..8].copy_from_slice(&(1u32 << i).to_le_bytes());
+                        let st = unsafe { get_f(handle, b.as_mut_ptr().cast(), 984) } as i32;
+                        if st == 0 {
+                            Some(b)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+            let pre = dump_all();
+            if pre.iter().all(Option::is_none) {
+                println!("  TARGET pre-dump: every slot refused — skip");
+                break 't13;
+            }
+            // documented STATUS entry0 的 remove_tdp（entry 表 @8，stride 336，
+            // dword3 = remove_tdp 旗，见 T9 dump 布局）。
+            let e0 = 8usize;
+            let old_tdp = u32::from_le_bytes(s0[e0 + 12..e0 + 16].try_into().unwrap());
+            let new_tdp: u32 = if old_tdp != 0 { 0 } else { 1 };
+            let mut s1 = s0.clone();
+            s1[e0 + 12..e0 + 16].copy_from_slice(&new_tdp.to_le_bytes());
+            let st_set = unsafe { set_pol_f(handle, s1.as_mut_ptr().cast(), status_len) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let retained = pol_get(0xE9C425A1, (3 << 16) | 1352, status_len)
+                .map(|b| u32::from_le_bytes(b[e0 + 12..e0 + 16].try_into().unwrap()) == new_tdp)
+                .unwrap_or(false);
+            println!(
+                "  entry0 remove_tdp flip {old_tdp} -> {new_tdp}: SET={st_set} retained={retained}"
+            );
+            if st_set != 0 || !retained {
+                println!(
+                    "  documented SetStatus didn't persist (RTX 50 desktop refuses) — the flag hunt needs a mobile lane (4060L)"
+                );
+            } else {
+                let post = dump_all();
+                let mut hits = 0usize;
+                for (i, (a, b2)) in pre.iter().zip(post.iter()).enumerate() {
+                    let (Some(a), Some(b2)) = (a, b2) else {
+                        continue;
+                    };
+                    for (off, w) in a.chunks_exact(4).enumerate() {
+                        let wa = u32::from_le_bytes(w.try_into().unwrap());
+                        let wb = u32::from_le_bytes(b2[off * 4..off * 4 + 4].try_into().unwrap());
+                        if wa != wb {
+                            hits += 1;
+                            println!(
+                                "  slot{i} dword{off} (abs {}): {wa:#010x} -> {wb:#010x}",
+                                4 + off * 4
+                            );
+                        }
+                    }
+                }
+                if hits == 0 {
+                    println!(
+                        "  no TARGET dword moved — bRemoveTdpLimit is NOT mirrored in the v2|984 buffer (STATUS-family-only field)"
+                    );
+                } else {
+                    println!(
+                        "  ({hits} dword(s) moved — the mover = the bRemoveTdpLimit flag in TARGET v2|984)"
+                    );
+                }
+            }
+            // 还原：原样 SET 回 GET 到的 STATUS（rmw 恢复）。
+            let st_rst = unsafe { set_pol_f(handle, s0.as_mut_ptr().cast(), status_len) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let rst_ok = pol_get(0xE9C425A1, (3 << 16) | 1352, status_len)
+                .map(|b| b[e0 + 12..e0 + 16] == s0[e0 + 12..e0 + 16])
+                .unwrap_or(false);
+            println!("  restore original STATUS: SET={st_rst} verified={rst_ok}");
+        }
+    } else {
+        println!(
+            "T13 flag-hunt arm skipped — set NVOC_ALLOW_TDP_FLAG_WRITE=1 (mobile lane required)"
+        );
+    }
+
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
     println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
     let info1 = pol_get(0x0D258BB5, (3 << 16) | 1400, info_len);
