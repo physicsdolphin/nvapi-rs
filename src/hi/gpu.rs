@@ -1864,6 +1864,22 @@ impl Gpu {
         self.gpu.thermal_limit()
     }
 
+    /// Flip `bRemoveTdpLimit` on every armed thermal policy via the raw
+    /// field-level RMW (the only TRUE-write recipe that retains on desktop —
+    /// full-struct writes with touched/cleared pff bits are accepted-but-
+    /// dropped). Returns whether the flip survived. HIGH RISK: TRUE releases
+    /// the TDP-derived thermal clamp. See
+    /// [`PhysicalGpu::set_thermal_policy_remove_tdp`](crate::PhysicalGpu::set_thermal_policy_remove_tdp).
+    pub fn set_thermal_policy_remove_tdp(&self, enable: bool) -> crate::Result<bool> {
+        self.gpu.set_thermal_policy_remove_tdp(enable)
+    }
+
+    /// Per-slot `bRemoveTdpLimit` mirror from the raw TARGET v2|984 buffer
+    /// (entry dword14, active-low). `None` for unpopulated slots.
+    pub fn thermal_target_remove_tdp_flags(&self) -> crate::Result<Vec<Option<bool>>> {
+        self.gpu.thermal_target_remove_tdp_flags()
+    }
+
     pub fn set_cooler_levels<I: IntoIterator<Item = (FanCoolerId, CoolerSettings)>>(
         &self,
         levels: I,

@@ -7650,6 +7650,118 @@ impl PhysicalGpu {
         v2.convert_raw().map_err(Into::into)
     }
 
+    /// Flip the documented STATUS family's `bRemoveTdpLimit` for every armed
+    /// policy — raw field-level RMW (GET v3|1352, patch each armed entry's
+    /// remove_tdp dword @ entry+12, SET 0x34C0B13D, re-GET verify).
+    ///
+    /// Full-struct writes that touch or clear the armed pff bits are
+    /// accepted-but-dropped on desktop drivers (live 2070/621: the temp wall
+    /// applies while flag+curve silently drop); keeping the armed pff bits
+    /// untouched is the only TRUE-write recipe that retains (probe T13:
+    /// SET=0, retained, and the TARGET v2|984 slot-entry dword14 mirror
+    /// moved 1→0 — that mirror is ACTIVE-LOW, 0 = clamp released).
+    /// Returns whether the flip survived the re-read (false when nothing is
+    /// armed or the driver dropped it). HIGH RISK: TRUE releases the
+    /// TDP-derived thermal clamp.
+    pub fn set_thermal_policy_remove_tdp(&self, enable: bool) -> crate::Result<bool> {
+        trace!("gpu.set_thermal_policy_remove_tdp({enable})");
+        const SZ: usize = 1352;
+        const MAGIC: u32 = (3 << 16) | 1352;
+        type StatusFn = unsafe extern "C" fn(
+            sys::handles::NvPhysicalGpuHandle,
+            *mut core::ffi::c_void,
+            usize,
+        ) -> sys::NvAPI_Status;
+        let resolve = |id: u32| -> crate::Result<StatusFn> {
+            match sys::nvapi_QueryInterface(id) {
+                Ok(p) if !p.is_null() => {
+                    Ok(unsafe { core::mem::transmute::<*mut core::ffi::c_void, StatusFn>(p) })
+                }
+                _ => Err(crate::Error::Nvapi(crate::NvapiError {
+                    nvid: sys::Api::NvAPI_GPU_ClientThermalPoliciesGetStatus,
+                    status: crate::Status::NoImplementation,
+                    raw_status: None,
+                })),
+            }
+        };
+        let get_f = resolve(0xE9C425A1)?;
+        let set_f = resolve(0x34C0B13D)?;
+
+        let mut buf = vec![0u8; SZ];
+        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        let st = unsafe { get_f(self.0, buf.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalPoliciesGetStatus, st)?;
+        let count = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if count == 0 {
+            return Ok(false);
+        }
+        let stride = (SZ - 8) / 4; // 336 B per armed-policy entry
+        for i in 0..count {
+            let off = 8 + i * stride + 12;
+            buf[off..off + 4].copy_from_slice(&(enable as u32).to_le_bytes());
+        }
+        let st_set = unsafe { set_f(self.0, buf.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalPoliciesSetStatus, st_set)?;
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut rb = vec![0u8; SZ];
+        rb[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        let st_rb = unsafe { get_f(self.0, rb.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalPoliciesGetStatus, st_rb)?;
+        let rb_count = u32::from_le_bytes(rb[4..8].try_into().unwrap()) as usize;
+        let retained = rb_count == count
+            && (0..count).all(|i| {
+                let off = 8 + i * stride + 12;
+                u32::from_le_bytes(rb[off..off + 4].try_into().unwrap()) == enable as u32
+            });
+        Ok(retained)
+    }
+
+    /// Per-slot `bRemoveTdpLimit` mirror readout from the raw TARGET v2|984
+    /// buffer (entry dword14, ACTIVE-LOW: 0 = TDP clamp released /
+    /// remove_tdp TRUE, 1 = clamp armed / FALSE — live-verified on 2070/621
+    /// via probe T13's flag flip). `None` when the slot GET refused
+    /// (unpopulated slot). This is the readout lane for GPUs where the
+    /// documented STATUS family arms nothing (RTX 50 desktop).
+    pub fn thermal_target_remove_tdp_flags(&self) -> crate::Result<Vec<Option<bool>>> {
+        trace!("gpu.thermal_target_remove_tdp_flags()");
+        const SZ: usize = 984;
+        const MAGIC: u32 = (2 << 16) | 984;
+        type TargetFn = unsafe extern "C" fn(
+            sys::handles::NvPhysicalGpuHandle,
+            *mut core::ffi::c_void,
+            usize,
+        ) -> sys::NvAPI_Status;
+        let get_f = match sys::nvapi_QueryInterface(0xC4554575) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<*mut core::ffi::c_void, TargetFn>(p)
+            },
+            _ => {
+                return Err(crate::Error::Nvapi(crate::NvapiError {
+                    nvid: sys::Api::NvAPI_GPU_ClientThermalTargetGetStatus,
+                    status: crate::Status::NoImplementation,
+                    raw_status: None,
+                }));
+            }
+        };
+        let mut out = Vec::new();
+        for slot in 0..16usize {
+            let mut buf = vec![0u8; SZ];
+            buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+            buf[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+            let st = unsafe { get_f(self.0, buf.as_mut_ptr().cast(), SZ) };
+            if st != 0 {
+                out.push(None);
+                continue;
+            }
+            // entry dword14 = buffer dword (15*slot + 19) = bytes 60*slot+76..80
+            let off = (15 * slot + 19) * 4;
+            let d = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            out.push(Some(d == 0));
+        }
+        Ok(out)
+    }
+
     pub fn set_thermal_limit<I: IntoIterator<Item = crate::thermal::ThermalLimit>>(
         &self,
         value: I,
