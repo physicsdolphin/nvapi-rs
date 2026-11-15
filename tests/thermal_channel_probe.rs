@@ -1524,234 +1524,154 @@ fn thermal_channel_probe() {
         }
     }
 
-    // ---- ⑨T15: C 紧凑 STATUS 的真源——RM control 0x2080B26C over NVAPI 0x0700002F ----
-    // mVolt sub_140277BB0 反编译（"Thermal policy mode readback"）：请求 1496B
-    // [+0=id][+52=0x2080B26C][+64=mask][0xFF 哨兵 @88 与 88k+84/88k+88(k=1..15)]；
-    // 响应 guard +44=1/+48=id/+52=cmd/+64=mask；payload @+56 = C(1440B)——
-    // C+8=mask 的位置严丝合缝（56+8=64）。0x0700002F = 0x07 系 NVAPI escape 族
-    // （同 0x07000191 VoltRails 车道）。备选 transport：0x07000191。
-    println!("=== [T15] C-source: RM control 0x2080B26C via NVAPI escape ===");
+    // ---- ⑪T18: C 紧凑 STATUS 直读——impl 内部方法 0x0700018F + RM 0x2080852C ----
+    // 方法（离线核验 610/621.01/621.24 三代 impl 同构）：
+    //   ① impl 里 `mov ecx, 0x0700018F; call rel32`（B9 8F 01 00 07 E8）恒 28 个
+    //      调用点，收敛到两个传输函数（mVolt 用 6 参 flavor）；
+    //   ② 请求 1496B：+48=设备 id（= (u32)物理句柄，621.24 锚函数自证
+    //      `mov [r14+30h], esi` = 自身 rcx 低 32 位）、+52=RM control 0x2080852C、
+    //      +64=mask、+88 起每 88B 槽 0xFF 哨兵（@88k-4 与 @88k）；
+    //   ③ transport(0x0700018F, req, 1496, 0, 0, 0, 0)；
+    //   ④ 响应 guard：+44==1、+48=id echo、+52==cmd echo、+64==mask echo；
+    //      payload C(1440B) @ +56（C+8=mask 与 +64 重合自洽）。
+    println!("=== [T18] C readout via impl transport (method 0x0700018F) ===");
     {
-        let idv = handle.as_ptr() as usize as u32;
-        let build15 = |mask: u32| -> Vec<u8> {
-            let mut b = vec![0u8; 1496];
-            b[0..4].copy_from_slice(&idv.to_le_bytes());
-            b[52..56].copy_from_slice(&0x2080_B26Cu32.to_le_bytes());
-            b[64..68].copy_from_slice(&mask.to_le_bytes());
-            b[88] = 0xFF;
-            for k in 1..16usize {
-                let o = 88 * k;
-                if o + 88 <= 1496 {
-                    b[o + 84] = 0xFF;
-                    b[o + 88] = 0xFF;
-                }
-            }
-            b
-        };
-        let report15 = |tag: &str, b: &[u8]| {
-            let st44 = u32::from_le_bytes(b[44..48].try_into().unwrap());
-            let echo_id = u32::from_le_bytes(b[48..52].try_into().unwrap());
-            let echo_cmd = u32::from_le_bytes(b[52..56].try_into().unwrap());
-            let echo_mask = u32::from_le_bytes(b[64..68].try_into().unwrap());
-            println!(
-                "  {tag}: guard st(+44)={st44} id(+48)={echo_id:#x}(want {idv:#x}) cmd(+52)={echo_cmd:#x} mask(+64)={echo_mask:#x}"
-            );
-            if st44 == 1 && echo_cmd == 0x2080_B26C {
-                // payload @+56 = C(1440B)：逐 armed 槽解析
-                let cmask = echo_mask;
-                for i in 0..16usize {
-                    if cmask & (1 << i) == 0 {
-                        continue;
-                    }
-                    let e = 88 * i + 32;
-                    if e + 88 > 1440 {
-                        break;
-                    }
-                    let p = 56 + e;
-                    let id = b[p];
-                    let temp = u32::from_le_bytes(b[p + 4..p + 8].try_into().unwrap());
-                    let d12 = u32::from_le_bytes(b[p + 12..p + 16].try_into().unwrap());
-                    let flag = b[p + 84];
-                    let mid: Vec<String> = b[p + 16..p + 60]
-                        .chunks_exact(4)
-                        .enumerate()
-                        .filter(|&(_, w)| w != [0u8, 0, 0, 0])
-                        .map(|(k, w)| {
-                            format!(
-                                "d{}={:#010x}",
-                                4 + k,
-                                u32::from_le_bytes(w.try_into().unwrap())
-                            )
-                        })
-                        .collect();
-                    let blk: Vec<String> = b[p + 60..p + 84]
-                        .chunks_exact(4)
-                        .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
-                        .collect();
-                    println!(
-                        "  C slot{i}: id={id} temp={:.2}C d12={d12:#x} remove_tdp={} mid=[{}] ctrl=[{}]",
-                        q8c(temp),
-                        flag == 1,
-                        mid.join(" "),
-                        blk.join(" ")
-                    );
-                }
-            }
-        };
-        for &xport in &[0x0700002Fu32, 0x07000191u32] {
-            let Some(f) = resolve14(xport) else {
-                println!("  transport {xport:#x}: QueryInterface FAILED");
-                continue;
-            };
-            for &mask in &[1u32, 0x5u32] {
-                let mut b = build15(mask);
-                let st = unsafe { f(handle, b.as_mut_ptr().cast(), 1496) } as i32;
-                println!("  transport {xport:#x} mask={mask:#x}: st={st}");
-                if st == 0 {
-                    report15(&format!("  resp {xport:#x}"), &b);
-                }
-            }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> isize;
+            fn VirtualQuery(addr: *const u8, info: *mut u8, len: usize) -> usize;
         }
-
-        // ---- T16: 锚内模式派生 C 的真传输（sub_14028E600/sub_140277150 完整复刻）----
-        // C 传输 fn = TARGET GET-prime(0xC4554575) 解析地址 + off1，off1 从锚函数
-        // 内部六个唯一字节模式的排序约束 + 两条 rel32 引用解出：
-        //   off1 = p24 + rel32@(锚+p24+36) + 40；off2 = p31 + rel32@(锚+p31+12) + 16
-        //   （p31 == p24+40；序言校验 48 85 D2 0F 84…在派生2 = 锚+off2 上做）。
-        // 模式 = 621 世代 nvapi64 构建指纹（mVolt 0.50.13 同款）。
-        println!("=== [T16] derive C transport from TARGET anchor (pattern set) ===");
-        let anchor = resolve14(0xC4554575).map_or(0usize, |f| unsafe {
-            core::mem::transmute::<
-                unsafe extern "C" fn(
-                    nvapi::sys::handles::NvPhysicalGpuHandle,
-                    *mut core::ffi::c_void,
-                    usize,
-                ) -> nvapi::sys::NvAPI_Status,
-                usize,
-            >(f)
-        });
-        if anchor == 0 {
-            println!("  anchor QueryInterface FAILED");
+        let mut modname: Vec<u16> = "nvapi64_impl.dll\0".encode_utf16().collect();
+        let base = unsafe { GetModuleHandleW(modname.as_mut_ptr()) } as usize;
+        if base == 0 {
+            println!("  nvapi64_impl.dll not loaded (no QI call forced it yet)");
         } else {
-            println!("  anchor fn @ {anchor:#x}");
-            const PAT1: [u8; 6] = [0x48, 0x8B, 0xFA, 0x4C, 0x8B, 0xF9];
-            const PAT2: [u8; 20] = [
-                0x45, 0x89, 0x7E, 0x30, 0x41, 0xC7, 0x46, 0x34, 0x2C, 0x85, 0x80, 0x20, 0x41, 0x8B,
-                0x45, 0x04, 0x41, 0x89, 0x46, 0x40,
-            ];
-            const PAT3: [u8; 23] = [
-                0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x28, 0x00, 0xC6,
-                0x44, 0x24, 0x20, 0x00, 0x45, 0x33, 0xC9, 0x41, 0xB8,
-            ];
-            const PAT4: [u8; 12] = [
-                0x89, 0x45, 0x00, 0x48, 0x8D, 0x55, 0x00, 0x41, 0x8B, 0x4E, 0x2C, 0xE8,
-            ];
-            const PAT5: [u8; 30] = [
-                0x41, 0x0F, 0xB6, 0xCF, 0x48, 0x6B, 0xF9, 0x58, 0x49, 0x03, 0xFE, 0x48, 0x6B, 0xD9,
-                0x3C, 0x49, 0x03, 0xDD, 0x8B, 0x47, 0x5C, 0x89, 0x43, 0x1C, 0x8B, 0x47, 0x64, 0x89,
-                0x43, 0x20,
-            ];
-            const PAT6: [u8; 20] = [
-                0x38, 0x8F, 0xAC, 0x00, 0x00, 0x00, 0x0F, 0x94, 0xC1, 0x0F, 0xB6, 0x43, 0x4C, 0x24,
-                0xFE, 0x0A, 0xC8, 0x88, 0x4B, 0x4C,
-            ];
-            const PAT7: [u8; 45] = [
-                0x8B, 0x87, 0x98, 0x00, 0x00, 0x00, 0x89, 0x43, 0x38, 0x8B, 0x87, 0x9C, 0x00, 0x00,
-                0x00, 0x89, 0x43, 0x3C, 0x8B, 0x87, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x43, 0x40, 0x8B,
-                0x87, 0xA4, 0x00, 0x00, 0x00, 0x89, 0x43, 0x44, 0x8B, 0x87, 0xA8, 0x00, 0x00, 0x00,
-                0x89, 0x43, 0x48,
-            ];
-            let find_unique = |hay: &[u8], needle: &[u8]| -> Option<usize> {
-                let first = hay.windows(needle.len()).position(|w| w == needle)?;
-                let rest = &hay[first + 1..];
-                if rest.windows(needle.len()).any(|w| w == needle) {
-                    return None; // 非唯一
+            println!("  impl base = {base:#x}");
+            // 扫 committed 可执行区找 B9 8F 01 00 07 E8 + rel32
+            const SIG: [u8; 6] = [0xB9, 0x8F, 0x01, 0x00, 0x07, 0xE8];
+            let mut targets: Vec<(usize, usize)> = Vec::new(); // (addr, votes)
+            let mut addr = base;
+            let mut mbi = [0u8; 48];
+            loop {
+                let n = unsafe { VirtualQuery(addr as *const u8, mbi.as_mut_ptr(), mbi.len()) };
+                if n == 0 {
+                    break;
                 }
-                Some(first)
-            };
-            let window = unsafe { std::slice::from_raw_parts(anchor as *const u8, 0x4000) };
-            let r = (|| -> Option<(usize, usize, i32)> {
-                let p10 = find_unique(window, &PAT1)?;
-                let p17 = find_unique(window, &PAT2)?;
-                let p24 = find_unique(window, &PAT3)?;
-                let p31 = find_unique(window, &PAT4)?;
-                let p38 = find_unique(window, &PAT5)?;
-                let p44 = find_unique(window, &PAT6)?;
-                if !(p10 < p17 && p17 < p24) {
-                    return None;
+                let rb = usize::from_le_bytes(mbi[0..8].try_into().unwrap());
+                let rs = usize::from_le_bytes(mbi[24..32].try_into().unwrap());
+                let state = u32::from_le_bytes(mbi[32..36].try_into().unwrap());
+                let prot = u32::from_le_bytes(mbi[36..40].try_into().unwrap());
+                if rb > base + 0x2000_0000 {
+                    break;
                 }
-                if p31 != p24 + 40 || !(p31 < p38 && p38 < p44) {
-                    return None;
-                }
-                if p31 + 16 > window.len() - 256 {
-                    return None;
-                }
-                let v47 = u32::from_le_bytes(window[p24 + 23..p24 + 27].try_into().unwrap());
-                let q27 = u64::from_le_bytes(window[p24 + 27..p24 + 35].try_into().unwrap());
-                if q27 != 0x0700_18FB_9D68_B49 || window[p24 + 35] != 0xE8 {
-                    return None;
-                }
-                if (v47.wrapping_sub(1)) > 0xFFFFF {
-                    return None;
-                }
-                let p53 = find_unique(window, &PAT7)?;
-                if p53 + PAT7.len() != p44 {
-                    return None;
-                }
-                let rel1 = i32::from_le_bytes(window[p24 + 36..p24 + 40].try_into().unwrap());
-                let rel2 = i32::from_le_bytes(window[p31 + 12..p31 + 16].try_into().unwrap());
-                Some((
-                    p24 + rel1 as usize + 40,
-                    p31 + rel2 as usize + 16,
-                    v47 as i32,
-                ))
-            })();
-            match r {
-                Some((off1, off2, v47)) => {
-                    println!(
-                        "  derived: off1={off1:#x} off2={off2:#x} v47={v47} -> transport @ {:#x}",
-                        anchor + off1
-                    );
-                    // 派生2 的序言校验（48 85 D2 0F 84 / 83 3A 00 0F 85 / 32 C0 C3）
-                    let d2 =
-                        unsafe { std::slice::from_raw_parts((anchor + off2) as *const u8, 24) };
-                    let d0 = u32::from_le_bytes(d2[0..4].try_into().unwrap());
-                    let d9 = u32::from_le_bytes(d2[9..13].try_into().unwrap());
-                    let r5 = i32::from_le_bytes(d2[5..9].try_into().unwrap());
-                    let r14 = i32::from_le_bytes(d2[14..18].try_into().unwrap());
-                    let t = (r5 + 9) as usize;
-                    let sig_ok = d0 == 0x0FD2_8548
-                        && d2[4] == 0x84
-                        && d9 == 0x0F00_3A83
-                        && d2[13] == 0x85
-                        && (r5 - 9) as u64 <= 0xFEE
-                        && r5 + 9 == r14 + 18
-                        && d2[t] == 0x32
-                        && d2[t + 1] == 0xC0
-                        && d2[t + 2] == 0xC3;
-                    println!("  derived2 prologue check: {sig_ok}");
-                    let transport: unsafe extern "system" fn(
-                        u32,
-                        *mut u8,
-                        u32,
-                        usize,
-                        u8,
-                        u8,
-                        usize,
-                    ) -> u32 = unsafe { core::mem::transmute(anchor + off1) };
-                    for &mask in &[1u32, 0x5u32] {
-                        let mut b = build15(mask);
-                        let st =
-                            unsafe { transport(0x0700_002F, b.as_mut_ptr(), 1496, 0, 0, 0, 0) };
-                        println!("  C transport mask={mask:#x}: st={st:#x}");
-                        if st == 0 {
-                            report15("  C resp", &b);
+                if state == 0x1000 && (prot & 0xEE) != 0 && (prot & 0x100) == 0 {
+                    let s = rb.max(base);
+                    let e = (rb + rs).min(base + 0x2000_0000);
+                    let sl =
+                        unsafe { std::slice::from_raw_parts(s as *const u8, e.saturating_sub(s)) };
+                    for w in sl.windows(10) {
+                        if w[..6] == SIG {
+                            let rel = i32::from_le_bytes(w[6..10].try_into().unwrap());
+                            let site = s + (w.as_ptr() as usize - sl.as_ptr() as usize);
+                            let tgt = site + 10 + rel as usize;
+                            if let Some(t) = targets.iter_mut().find(|(a, _)| *a == tgt) {
+                                t.1 += 1;
+                            } else {
+                                targets.push((tgt, 1));
+                            }
                         }
                     }
                 }
-                None => println!(
-                    "  pattern set did not match this nvapi64 build (fingerprint is generation-specific — mVolt 0.50.13 targets 621.x)"
-                ),
+                addr = rb + rs;
+                if addr <= rb {
+                    break;
+                }
+            }
+            targets.sort_by_key(|&(_, v)| std::cmp::Reverse(v));
+            for &(t, v) in &targets {
+                println!(
+                    "  transport candidate {t:#x} (impl+{:#x}), votes={v}",
+                    t - base
+                );
+            }
+            // 请求构造（mVolt sub_140277BB0 精确复刻，id@+48 修正）
+            let idv = handle.as_ptr() as usize as u32;
+            let build18 = |mask: u32| -> Vec<u8> {
+                let mut b = vec![0u8; 1496];
+                b[48..52].copy_from_slice(&idv.to_le_bytes());
+                b[52..56].copy_from_slice(&0x2080_852Cu32.to_le_bytes());
+                b[64..68].copy_from_slice(&mask.to_le_bytes());
+                b[88] = 0xFF;
+                let mut k = 2usize;
+                while 88 * k < 1496 {
+                    b[88 * k - 4] = 0xFF;
+                    b[88 * k] = 0xFF;
+                    k += 1;
+                }
+                b
+            };
+            let report18 = |tag: &str, b: &[u8]| {
+                let st44 = u32::from_le_bytes(b[44..48].try_into().unwrap());
+                let e48 = u32::from_le_bytes(b[48..52].try_into().unwrap());
+                let e52 = u32::from_le_bytes(b[52..56].try_into().unwrap());
+                let e64 = u32::from_le_bytes(b[64..68].try_into().unwrap());
+                println!("  {tag}: guard st(+44)={st44} id={e48:#x} cmd={e52:#x} mask={e64:#x}");
+                if st44 == 1 && e52 == 0x2080_852C {
+                    let cmask = e64;
+                    for i in 0..16usize {
+                        if cmask & (1 << i) == 0 {
+                            continue;
+                        }
+                        let e = 56 + 88 * i + 32; // payload@+56, C entry @32+88i
+                        if e + 88 > b.len() {
+                            break;
+                        }
+                        let id = b[e];
+                        let temp = u32::from_le_bytes(b[e + 4..e + 8].try_into().unwrap());
+                        let d12 = u32::from_le_bytes(b[e + 12..e + 16].try_into().unwrap());
+                        let flag = b[e + 84];
+                        let mid: Vec<String> = b[e + 16..e + 60]
+                            .chunks_exact(4)
+                            .enumerate()
+                            .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                            .map(|(k, w)| {
+                                format!(
+                                    "d{}={:#010x}",
+                                    4 + k,
+                                    u32::from_le_bytes(w.try_into().unwrap())
+                                )
+                            })
+                            .collect();
+                        let blk: Vec<String> = b[e + 60..e + 84]
+                            .chunks_exact(4)
+                            .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                            .collect();
+                        println!(
+                            "  C slot{i}: id={id} temp={:.2}C d12={d12:#x} remove_tdp={} mid=[{}] ctrl=[{}]",
+                            (temp as i32) as f32 / 256.0,
+                            flag == 1,
+                            mid.join(" "),
+                            blk.join(" ")
+                        );
+                    }
+                }
+            };
+            type Transport =
+                unsafe extern "system" fn(u32, *mut u8, u32, usize, u8, u8, usize) -> u32;
+            for &(t, votes) in targets.iter().take(2) {
+                if votes < 3 {
+                    continue; // 只试高票候选（impl 标准 escape 对）
+                }
+                let transport: Transport = unsafe { core::mem::transmute(t) };
+                for &mask in &[1u32, 0x5u32, 0x13u32] {
+                    let mut req = build18(mask);
+                    let st = unsafe { transport(0x0700_018F, req.as_mut_ptr(), 1496, 0, 0, 0, 0) };
+                    println!("  call transport {t:#x} mask={mask:#x}: st={st:#x}");
+                    if st == 0 {
+                        report18(&format!("resp {t:#x}/{mask:#x}"), &req);
+                        break; // guard 通过即停
+                    }
+                }
             }
         }
     }
