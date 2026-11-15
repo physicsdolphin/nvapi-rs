@@ -388,6 +388,127 @@ fn thermal_channel_probe() {
         println!("  (poll done — changed dwords above = the fields mVolt writes)");
     }
 
+    // ---- ⑤T9 Thermal limits：documented POLICIES 族（0x0D258BB5 / 0xE9C425A1）----
+    // T8 判决：TARGET_STATUS(0xC4554575) 在 5060 Ti 上是静态 VBIOS 投影
+    // （range 全 [cur,cur,cur] 退化形，T8c 三场零变动）——mVolt 的
+    // Applied/Allowed（-40..105/-40..110）语义吻合的是这一族：
+    //   INFO  (0x0D258BB5, v3|1400)：per-entry {policy_id, min/default/max, flags}
+    //   STATUS(0xE9C425A1, v3|1352)：per-entry {policy_id, flags,
+    //     temp_limit_C(<<8), remove_tdp_limit(bRemoveTdpLimit), pff_curve}
+    // T9c = 双缓冲 15s 轮询 diff（总闸/Include/改值都在这上面找真字段）。
+    println!("=== [T9] Thermal limits: documented POLICIES family ===");
+    let pol_get = |id: u32, ver_magic: u32, len: usize| -> Option<Vec<u8>> {
+        let f = nvapi::sys::nvapi_QueryInterface(id).ok()?;
+        if f.is_null() {
+            return None;
+        }
+        let f = unsafe {
+            core::mem::transmute::<
+                *mut core::ffi::c_void,
+                unsafe extern "C" fn(
+                    nvapi::sys::handles::NvPhysicalGpuHandle,
+                    *mut core::ffi::c_void,
+                    usize,
+                ) -> nvapi::sys::NvAPI_Status,
+            >(f)
+        };
+        let mut b = vec![0u8; len];
+        b[0..4].copy_from_slice(&ver_magic.to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), len) } as i32;
+        if st == 0 {
+            Some(b)
+        } else {
+            println!("  GET {id:#x} st={st}");
+            None
+        }
+    };
+    let (info_len, status_len) = (1400usize, 1352usize);
+    let info0 = pol_get(0x0D258BB5, (3 << 16) | 1400, info_len);
+    let status0 = pol_get(0xE9C425A1, (3 << 16) | 1352, status_len);
+    if let Some(b) = &info0 {
+        println!("  --- INFO entries (v3, count guess via stride scan) ---");
+        // INFO_V2 entry = 24B {policy_id, unknown, min, default, max, flags};
+        // V3 entry layout opaque — dump all Q8 candidates + nonzero dwords.
+        for (k, w) in b.chunks_exact(4).enumerate().skip(1) {
+            let v = u32::from_le_bytes(w.try_into().unwrap());
+            if v == 0 {
+                continue;
+            }
+            let q8 = v as i32 as f32 / 256.0;
+            let tag = if v % 4 == 0 && v < 40000 && (v as i32) > -10000 {
+                format!(" = Q8 {q8:.2}C")
+            } else {
+                String::new()
+            };
+            if k < 40 {
+                println!("  INFO dword{k} (abs {}): {v:#010x}{tag}", 4 + k * 4);
+            }
+        }
+    }
+    if let Some(b) = &status0 {
+        println!("  --- STATUS entries (v3|1352) ---");
+        let count = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        println!("  count = {count}");
+        // entries[] is a FIXED 4-slot array (NVAPI_MAX_THERMAL_LIMIT_ENTRIES);
+        // count only says how many are valid — stride must come from the array.
+        let stride = (status_len - 8) / 4;
+        for e in 0..count as usize {
+            let s = 8 + e * stride;
+            let d: Vec<u32> = b[s..s + 16]
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            println!(
+                "  entry{e}: policy_id={} flags={:#x} temp_limit={}C remove_tdp={} (stride {stride}B)",
+                d[0],
+                d[1],
+                (d[2] >> 8) as i32,
+                d[3]
+            );
+        }
+    }
+    if info0.is_some() || status0.is_some() {
+        println!("=== [T9c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
+        let mut prev: Vec<(&str, Vec<u8>)> = Vec::new();
+        if let Some(b) = info0 {
+            prev.push(("info", b));
+        }
+        if let Some(b) = status0 {
+            prev.push(("status", b));
+        }
+        for it in 1..=60 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mut next: Vec<(&str, Vec<u8>)> = Vec::new();
+            for (name, _) in &prev {
+                let buf = match *name {
+                    "info" => pol_get(0x0D258BB5, (3 << 16) | 1400, info_len),
+                    _ => pol_get(0xE9C425A1, (3 << 16) | 1352, status_len),
+                };
+                if let Some(b) = buf {
+                    next.push((name, b));
+                }
+            }
+            for (name, old) in &prev {
+                if let Some((_, new)) = next.iter().find(|(n, _)| n == name) {
+                    if old != new {
+                        for k in 0..old.len() / 4 {
+                            let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+                            let n = u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
+                            if o != n {
+                                println!(
+                                    "  [it{it}] {name} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                                    4 + k * 4
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            prev = next;
+        }
+        println!("  (poll done — changed dwords above = the Thermal limits live fields)");
+    }
+
     // ---- ⑥ 写臂（双重门控）：完整配方 = 值(entry_k+84) + 使能标志字节(47/101/128) + RMW + 全缓冲还原
     // 依据：T7 活体 diff（mVolt apply 时 CTRL +0x2F/+0x65/+0x80 置 1 + Status ch1 钉 1280=5°C）。
     if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
