@@ -1767,56 +1767,60 @@ fn thermal_channel_probe() {
     {
         if let Some(f) = resolve14(0x4A82C2B1) {
             println!("  QueryInterface 0x4A82C2B1: OK");
-            type Wrapper17 = unsafe extern "C" fn(
-                nvapi::sys::handles::NvPhysicalGpuHandle,
-                u32,
-                *mut u32,
-            ) -> i32;
+            type Wrapper17 = unsafe extern "C" fn(u32, u32, *mut u32) -> i32;
             let wrap: Wrapper17 = unsafe { core::mem::transmute(f) };
-            for &mask in &[1u32, 0x5u32] {
-                let mut out = vec![0u32; 1024];
-                out[0] = 0x10014;
-                out[1] = 1440;
-                let st = unsafe { wrap(handle, mask, out.as_mut_ptr()) };
-                println!(
-                    "  mask={mask:#x}: st={st} (out[0]={:#x} out[1]={:#x})",
-                    out[0], out[1]
-                );
-                // 产物扫描：找 C 布局特征（mask@+8、entries @32+88i id=4）
-                let nz: Vec<(usize, u32)> = out
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .filter(|&(_, v)| v != 0)
-                    .take(40)
-                    .collect();
-                println!(
-                    "  nonzero: {}",
-                    nz.iter()
-                        .map(|(k, v)| format!("[{k}]={v:#x}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                let cmask = out[2];
-                for i in 0..16usize {
-                    if cmask & (1 << i) == 0 {
-                        continue;
-                    }
-                    let base = 8 + 22 * i; // entry byte 32+88i → dword 8+22i
-                    if base + 22 > out.len() {
-                        break;
-                    }
-                    let id = out[base] & 0xFF;
-                    if id != 4 {
-                        continue;
-                    }
-                    let temp = out[base + 1];
-                    let flag = out[base + 21] & 0xFF;
+            // a1 契约（472 单体反编译）：(a1 & 0xFF000000) == 0xDE000000 或 a1 == 0
+            let handle_id = handle.as_ptr() as usize as u32;
+            println!(
+                "  handle id = {handle_id:#x} (top byte {:#x})",
+                handle_id >> 24
+            );
+            for &a1 in &[handle_id] {
+                for &mask in &[1u32, 0x5u32] {
+                    let mut out = vec![0u32; 1024];
+                    out[0] = 0x10014;
+                    out[1] = 1440;
+                    let st = unsafe { wrap(a1, mask, out.as_mut_ptr()) };
                     println!(
-                        "  C slot{i}: id=4 temp={:.2}C remove_tdp={}",
-                        (temp as i32) as f32 / 256.0,
-                        flag == 1
+                        "  a1={a1:#x} mask={mask:#x}: st={st} (out[0]={:#x} out[1]={:#x})",
+                        out[0], out[1]
                     );
+                    // 产物扫描：找 C 布局特征（mask@+8、entries @32+88i id=4）
+                    let nz: Vec<(usize, u32)> = out
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|&(_, v)| v != 0)
+                        .take(40)
+                        .collect();
+                    println!(
+                        "  nonzero: {}",
+                        nz.iter()
+                            .map(|(k, v)| format!("[{k}]={v:#x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    let cmask = out[2];
+                    for i in 0..16usize {
+                        if cmask & (1 << i) == 0 {
+                            continue;
+                        }
+                        let base = 8 + 22 * i; // entry byte 32+88i → dword 8+22i
+                        if base + 22 > out.len() {
+                            break;
+                        }
+                        let id = out[base] & 0xFF;
+                        if id != 4 {
+                            continue;
+                        }
+                        let temp = out[base + 1];
+                        let flag = out[base + 21] & 0xFF;
+                        println!(
+                            "  C slot{i}: id=4 temp={:.2}C remove_tdp={}",
+                            (temp as i32) as f32 / 256.0,
+                            flag == 1
+                        );
+                    }
                 }
             }
         } else {
