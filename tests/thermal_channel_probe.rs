@@ -914,6 +914,118 @@ fn thermal_channel_probe() {
         }
     }
 
+    // ---- ⑥T12 TARGET 族写实验（硬墙判定）----
+    // 判决问题：SET(0xE097144F) 是否接受 >info max 的值（hotspot 106-110 vs
+    // info max=105）。配方 = TARGET RMW：单槽 GET-prime(0xC4554575, 1<<slot)
+    // → patch temp Q8 @dword(15·slot+7) → SET(0xE097144F, mask=1<<slot) →
+    // retain 复读 → 还原 stock。三门控：NVOC_ALLOW_LIMIT_WRITE +
+    // NVOC_LIMIT_SLOT(0=GPU/1=Hotspot/4=Memory) + NVOC_LIMIT_CELSIUS。
+    if std::env::var("NVOC_ALLOW_LIMIT_WRITE").is_ok() {
+        let slot: usize = std::env::var("NVOC_LIMIT_SLOT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let celsius: f32 = std::env::var("NVOC_LIMIT_CELSIUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(106.0);
+        println!("=== [T12] TARGET RMW write: slot{slot} -> {celsius} C ===");
+        if slot >= 16 {
+            println!("  slot >= 16 out of the 984B buffer — abort");
+            return;
+        }
+        let tg = |mask: u32| -> Option<Vec<u8>> {
+            let f = nvapi::sys::nvapi_QueryInterface(0xC4554575).ok()?;
+            if f.is_null() {
+                return None;
+            }
+            let f = unsafe {
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(f)
+            };
+            let mut b = vec![0u8; 984];
+            b[0..4].copy_from_slice(&0x0002_03D8u32.to_le_bytes());
+            b[4..8].copy_from_slice(&mask.to_le_bytes());
+            let st = unsafe { f(handle, b.as_mut_ptr().cast(), 984) } as i32;
+            if st == 0 {
+                Some(b)
+            } else {
+                println!("  GET-prime st={st}");
+                None
+            }
+        };
+        let set_f = match nvapi::sys::nvapi_QueryInterface(0xE097144F) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
+            },
+            _ => {
+                println!("  QueryInterface(Set) FAILED");
+                return;
+            }
+        };
+        let Some(mut buf) = tg(1u32 << slot) else {
+            println!("  GET-prime refused — abort");
+            return;
+        };
+        let t_off = 4 * (15 * slot + 7);
+        let stock = u32::from_le_bytes(buf[t_off..t_off + 4].try_into().unwrap());
+        println!(
+            "  stock Q8={stock:#010x} ({} C); writing {} C (Q8 {:#010x})",
+            stock as i32 as f32 / 256.0,
+            celsius,
+            (celsius * 256.0) as i32 as u32
+        );
+        let q8 = (celsius * 256.0) as i32 as u32;
+        buf[t_off..t_off + 4].copy_from_slice(&q8.to_le_bytes());
+        let st_set = unsafe { set_f(handle, buf.as_mut_ptr().cast(), 984) } as i32;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // retain 复读
+        let retained =
+            tg(1u32 << slot).map(|b| u32::from_le_bytes(b[t_off..t_off + 4].try_into().unwrap()));
+        let ret_ok = retained == Some(q8);
+        println!(
+            "  SET={st_set} retain={} (readback {})",
+            if ret_ok {
+                "YES <— ACCEPTED"
+            } else {
+                "NO (driver rewrote/dropped)"
+            },
+            retained
+                .map(|v| format!("{} C", v as i32 as f32 / 256.0))
+                .unwrap_or_else(|| "GET failed".into()),
+        );
+        // 还原 stock
+        if let Some(mut rb) = tg(1u32 << slot) {
+            rb[t_off..t_off + 4].copy_from_slice(&stock.to_le_bytes());
+            let st_rst = unsafe { set_f(handle, rb.as_mut_ptr().cast(), 984) } as i32;
+            let back = tg(1u32 << slot)
+                .map(|b| u32::from_le_bytes(b[t_off..t_off + 4].try_into().unwrap()));
+            println!(
+                "  restore SET={st_rst} readback={} (stock {} C)",
+                back.map(|v| format!("{v:#010x}"))
+                    .unwrap_or_else(|| "GET failed".into()),
+                stock as i32 as f32 / 256.0
+            );
+        }
+    } else {
+        println!(
+            "T12 write arm skipped — set NVOC_ALLOW_LIMIT_WRITE=1 (+NVOC_LIMIT_SLOT, NVOC_LIMIT_CELSIUS)"
+        );
+    }
+
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
     // 头（T9 段）尾两次 dump 的差异 = 运行期间 mVolt 真正落盘的字段。
     println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
