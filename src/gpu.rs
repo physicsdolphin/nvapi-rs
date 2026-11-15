@@ -7454,6 +7454,92 @@ impl PhysicalGpu {
         Ok(())
     }
 
+    /// Write one slot's thermal-policy throttle curve (the mVolt+ "Thermal
+    /// limits" write face, RE'd 2026-11-15 round 22/23): TARGET RMW with the
+    /// **v2|984** stamp — GET-prime (0xC4554575, single-bit mask 1<<slot),
+    /// patch the live throttle-curve quad at buffer bytes 60·slot+60..76 to
+    /// f(celsius) = [c+1, c, c-1, c-3] (Q8), SET (0xE097144F), then verify by
+    /// re-GET. **The static temp dword (15·slot+7) is a read-only info output
+    /// — patching it instead is rejected (SET=-1) on 5060 Ti/621.24**; the
+    /// curve quad is the consumed representation (GPU-Z "thermal limit"
+    /// throttle follows it). Live-verified: SET=0 + retain on RTX 5060 Ti.
+    ///
+    /// Slot identity: 0=GPU wall (87C stock), 1=Hotspot (105C), 4=Memory
+    /// (105C) on RTX 50 — same numbering as
+    /// [`Self::target_temperature_policies_with_info`].
+    ///
+    /// # Safety contract
+    /// NDA write path onto a protective thermal wall: raising the curve
+    /// delays throttling. The caller owns restore (re-write the stock curve
+    /// = f(stock temp), readable via [`Self::target_temperature`]).
+    pub fn set_thermal_policy_curve(&self, slot: usize, celsius: f32) -> crate::Result<()> {
+        trace!("gpu.set_thermal_policy_curve(slot{slot}, {celsius} C)");
+        if slot >= 16 {
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                slot as i64,
+            )));
+        }
+        const SZ: usize = 984;
+        const MAGIC: u32 = (2 << 16) | 984;
+        type TargetFn = unsafe extern "C" fn(
+            sys::handles::NvPhysicalGpuHandle,
+            *mut core::ffi::c_void,
+            usize,
+        ) -> sys::NvAPI_Status;
+        let resolve = |id: u32| -> crate::Result<TargetFn> {
+            match sys::nvapi_QueryInterface(id) {
+                Ok(p) if !p.is_null() => {
+                    Ok(unsafe { core::mem::transmute::<*mut core::ffi::c_void, TargetFn>(p) })
+                }
+                _ => Err(crate::Error::Nvapi(crate::NvapiError {
+                    nvid: sys::Api::NvAPI_GPU_ClientThermalTargetGetStatus,
+                    status: crate::Status::NoImplementation,
+                    raw_status: None,
+                })),
+            }
+        };
+        let get_f = resolve(0xC4554575)?;
+        let set_f = resolve(0xE097144F)?;
+
+        let mut buf = vec![0u8; SZ];
+        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+        let st = unsafe { get_f(self.0, buf.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalTargetGetStatus, st)?;
+
+        let base = 60 * slot + 60;
+        let q8 = (celsius * 256.0) as i32 as u32;
+        let curve = [
+            q8.wrapping_add(256),
+            q8,
+            q8.wrapping_sub(256),
+            q8.wrapping_sub(768),
+        ];
+        for (k, v) in curve.iter().enumerate() {
+            buf[base + 4 * k..base + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let st_set = unsafe { set_f(self.0, buf.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalTargetSetStatus, st_set)?;
+
+        // retain verify: the written quad must come back verbatim
+        let mut rb = vec![0u8; SZ];
+        rb[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        rb[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+        let st_rb = unsafe { get_f(self.0, rb.as_mut_ptr().cast(), SZ) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientThermalTargetGetStatus, st_rb)?;
+        for (k, v) in curve.iter().enumerate() {
+            let got = u32::from_le_bytes(rb[base + 4 * k..base + 4 * k + 4].try_into().unwrap());
+            if got != *v {
+                return Err(crate::Error::Nvapi(crate::NvapiError {
+                    nvid: sys::Api::NvAPI_GPU_ClientThermalTargetSetStatus,
+                    status: crate::Status::Error,
+                    raw_status: None,
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Apply a full control buffer as-is (RMW discipline: prime with
     /// [`Self::thermal_channel_control`], patch, then apply). See
     /// [`Self::set_thermal_channel_sim_temp`] for the safety contract.

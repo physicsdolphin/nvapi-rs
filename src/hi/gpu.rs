@@ -1846,6 +1846,15 @@ impl Gpu {
         self.gpu.clear_thermal_channel_sim_temps(channel_mask)
     }
 
+    /// Write one slot's thermal-policy throttle curve (mVolt Thermal limits
+    /// write face; v2|984 curve-quad recipe, the working policy-write path on
+    /// RTX50/621.24). See
+    /// [`PhysicalGpu::set_thermal_policy_curve`](crate::PhysicalGpu::set_thermal_policy_curve)
+    /// for the safety contract.
+    pub fn set_thermal_policy_curve(&self, slot: usize, celsius: f32) -> crate::Result<()> {
+        self.gpu.set_thermal_policy_curve(slot, celsius)
+    }
+
     pub fn set_cooler_levels<I: IntoIterator<Item = (FanCoolerId, CoolerSettings)>>(
         &self,
         levels: I,
