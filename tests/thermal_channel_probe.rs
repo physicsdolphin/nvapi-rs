@@ -795,6 +795,125 @@ fn thermal_channel_probe() {
         }
     }
 
+    // ---- ⑥T10 TARGET 族版本戳/尺寸扫描 ----
+    // 线索：mVolt 数字键 {1,2,21}——21 超出 984B/16 槽缓冲 → mVolt 的
+    // ThermalPolicyControl 可能是同族更大缓冲/不同版本戳。扫描 0xC4554575
+    // GET 与 0xE097144F-as-GET 的 (ver<<16)|size 接受域；缓冲按声明值分配
+    // （绝不得小于声明——第十五轮堆崩溃教训）。
+    println!("=== [T10] TARGET family version/size sweep ===");
+    let sweep = |id: u32, tag: &str| {
+        let f = match nvapi::sys::nvapi_QueryInterface(id) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
+            },
+            _ => {
+                println!("  {tag}: QueryInterface FAILED");
+                return;
+            }
+        };
+        for ver in [2u32, 3u32] {
+            for &slots in &[16usize, 22, 24, 32, 40, 48, 64] {
+                let sz = 984 + (slots - 16) * 60;
+                let mut b = vec![0u8; sz];
+                b[0..4].copy_from_slice(&(((ver << 16) | (sz as u32)) as u32).to_le_bytes());
+                // 单 bit 掩码强制（0xFFFF 会被驱动拒——medium 文档既知）；扫的是版本/尺寸接受域
+                b[4..8].copy_from_slice(&1u32.to_le_bytes());
+                let st = unsafe { f(handle, b.as_mut_ptr().cast(), sz) } as i32;
+                if st != 0 {
+                    continue;
+                }
+                // 深槽区（slot16 之后）是否有数据
+                let deep_nz = b[968..]
+                    .chunks_exact(4)
+                    .filter(|&w| w != [0u8, 0, 0, 0])
+                    .count();
+                println!(
+                    "  {tag} ver{ver} size={sz} ({slots} slots): st=0, deep nonzero dwords={deep_nz}"
+                );
+                if deep_nz > 0 {
+                    for k in 16..slots {
+                        let off = 968 + (k - 16) * 60;
+                        let e = &b[off..off + 60];
+                        let nz: Vec<String> = e
+                            .chunks_exact(4)
+                            .enumerate()
+                            .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                            .map(|(d, w)| {
+                                format!("d{d}={:#010x}", u32::from_le_bytes(w.try_into().unwrap()))
+                            })
+                            .collect();
+                        if !nz.is_empty() {
+                            println!("    slot {k}: {}", nz.join(" "));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    sweep(0xC4554575, "GET-prime");
+    sweep(0xE097144F, "SET-as-GET");
+
+    // ---- ⑥T11 PRIVATE INFO (0x2F69F8E5) 15704B 全缓冲特征扫描 ----
+    // 解码定案：mVolt ThermalPolicyInfo=0x2F69F8E5 / ThermalPolicyControl=0xC4554575
+    // （混淆 VM 复刻解码，decode_override_ids.py 同款）。wrapper 固定偏移
+    // （231·idx+232/233/234）在 5060 Ti 退化 —— 50 系布局可能不同。全缓冲
+    // 扫 Q8 特征值（-40/87/105/110 及温度样值）定位真实 min/max 域。
+    println!("=== [T11] PRIVATE INFO (0x2F69F8E5) full scan (15704B) ===");
+    {
+        let f = match nvapi::sys::nvapi_QueryInterface(0x2F69F8E5) {
+            Ok(p) if !p.is_null() => unsafe {
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
+            },
+            _ => {
+                println!("  QueryInterface FAILED");
+                return;
+            }
+        };
+        const SZ: usize = 15704;
+        let mut b = vec![0u8; SZ];
+        b[0..4].copy_from_slice(&((3u32 << 16) | SZ as u32).to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), SZ) } as i32;
+        println!("  GET st={st}");
+        if st == 0 {
+            let nz: Vec<(usize, u32)> = b
+                .chunks_exact(4)
+                .enumerate()
+                .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                .map(|(k, w)| (k, u32::from_le_bytes(w.try_into().unwrap())))
+                .collect();
+            println!("  nonzero dwords: {} (of {})", nz.len(), SZ / 4);
+            let cels = |v: u32| (v as i32) as f32 / 256.0;
+            for &(k, v) in nz.iter().take(200) {
+                let q = cels(v);
+                // 特征：Q8 温度样值域（-60..130C 整或半整），标注命中
+                let is_temp = (-15360i32..=33280i32).contains(&(v as i32)) && v % 4 == 0;
+                let mark = if is_temp {
+                    format!(" = Q8 {q:.2}C")
+                } else {
+                    String::new()
+                };
+                println!("  dword{k} (abs {}): {v:#010x}{mark}", 4 + k * 4);
+            }
+            if nz.len() > 200 {
+                println!("  ... ({} more nonzero dwords truncated)", nz.len() - 200);
+            }
+        }
+    }
+
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
     // 头（T9 段）尾两次 dump 的差异 = 运行期间 mVolt 真正落盘的字段。
     println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
