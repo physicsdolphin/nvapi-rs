@@ -582,8 +582,8 @@ pub mod undocumented {
     // mVolt's overlay persisting across its own polls.
     // ------------------------------------------------------------------
 
-    /// Thermal-channel CONTROL entry (108 B). Index = driver channel number
-    /// (same numbering as GetInfo's channel[] / priChIdx).
+    // Thermal-channel CONTROL entry (108 B). Index = driver channel number
+    // (same numbering as GetInfo's channel[] / priChIdx).
     nvstruct! {
         pub struct NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_ENTRY_V3 {
             /// Channel class — mirrors GetInfo's per-channel `ch_class`.
@@ -599,8 +599,8 @@ pub mod undocumented {
         }
     }
 
-    /// Thermal-channel control params (version 3). 10444 bytes
-    /// (76-byte header + 96 × 108-byte entries).
+    // Thermal-channel control params (version 3). 10444 bytes
+    // (76-byte header + 96 × 108-byte entries).
     nvstruct! {
         pub struct NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_PARAMS_V3 {
             pub version: NvVersion,
