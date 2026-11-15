@@ -112,8 +112,14 @@ fn thermal_channel_probe() {
     let get_ctrl = |id: u32, mask: u32| -> (i32, Vec<u8>) {
         let f = match nvapi::sys::nvapi_QueryInterface(id) {
             Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
             },
             _ => return (-9, Vec::new()),
         };
@@ -156,10 +162,11 @@ fn thermal_channel_probe() {
     // 用户期间在 mVolt UI 改模拟值 → 变动的 dword = 真字段（mVolt 实际写的地方）。
     println!("=== [T7] live poll-diff (15s): change mVolt GPU temp NOW ===");
     {
-        use nvapi::sys::gpu::thermal::undocumented::{
-            NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2, NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2,
-        };
         use nvapi::sys::api::{NvAPI_GPU_ThermChannelGetInfo, NvAPI_GPU_ThermChannelGetStatus};
+        use nvapi::sys::gpu::thermal::undocumented::{
+            NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2,
+            NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2,
+        };
         let get_all = |mask: u32| -> (Vec<u8>, Vec<u8>, Vec<i32>) {
             let mut ctrl = vec![0u8; 10444];
             ctrl[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
@@ -167,15 +174,21 @@ fn thermal_channel_probe() {
             unsafe { NvAPI_GPU_ThermChannelGetControl(handle, ctrl.as_mut_ptr().cast()) };
             let mut inf = NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2::default();
             inf.version = nvapi::sys::nvapi::NvVersion::new(
-                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(), 2);
+                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(),
+                2,
+            );
             unsafe { NvAPI_GPU_ThermChannelGetInfo(handle, &mut inf) };
             let mut st = NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2::default();
             st.version = nvapi::sys::nvapi::NvVersion::new(
-                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2>(), 2);
+                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2>(),
+                2,
+            );
             st.channel_mask = mask;
             unsafe { NvAPI_GPU_ThermChannelGetStatus(handle, &mut st) };
-            let stv: Vec<i32> = (0..32).filter(|i| mask & (1u32 << i) != 0)
-                .filter_map(|i| st.channel.get(i).copied()).collect();
+            let stv: Vec<i32> = (0..32)
+                .filter(|i| mask & (1u32 << i) != 0)
+                .filter_map(|i| st.channel.get(i).copied())
+                .collect();
             // INFO raw bytes: walk the struct via pointer (params are repr(C) nvstruct)
             let ibytes = unsafe {
                 core::slice::from_raw_parts(
@@ -187,9 +200,11 @@ fn thermal_channel_probe() {
             (ctrl, ibytes, stv)
         };
         let (c0, i0, s0) = get_all(channel_mask);
-        println!("  base captured: ctrl_nz={} info_nz={} status={s0:?}",
+        println!(
+            "  base captured: ctrl_nz={} info_nz={} status={s0:?}",
             nonzero_dwords(&c0, usize::MAX).len(),
-            nonzero_dwords(&i0, usize::MAX).len());
+            nonzero_dwords(&i0, usize::MAX).len()
+        );
         for it in 1..=60usize {
             std::thread::sleep(std::time::Duration::from_millis(250));
             let (c, i, sv) = get_all(channel_mask);
@@ -227,8 +242,14 @@ fn thermal_channel_probe() {
     let getm = |marker: usize| -> (i32, Vec<u8>) {
         let f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
             Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
             },
             _ => return (-9, Vec::new()),
         };
@@ -251,8 +272,14 @@ fn thermal_channel_probe() {
     {
         let f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
             Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
             },
             _ => {
                 println!("  SetControl-id: QueryInterface FAILED");
@@ -280,8 +307,14 @@ fn thermal_channel_probe() {
         println!("=== [T6] WRITE full recipe: ch{ch} sim={celsius} C ===");
         let f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
             Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
             },
             _ => {
                 println!("  QueryInterface failed");
@@ -290,8 +323,14 @@ fn thermal_channel_probe() {
         };
         let set_f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
             Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
+                core::mem::transmute::<
+                    *mut core::ffi::c_void,
+                    unsafe extern "C" fn(
+                        nvapi::sys::handles::NvPhysicalGpuHandle,
+                        *mut core::ffi::c_void,
+                        usize,
+                    ) -> nvapi::sys::NvAPI_Status,
+                >(p)
             },
             _ => {
                 println!("  QueryInterface(SetControl) failed");
@@ -304,7 +343,10 @@ fn thermal_channel_probe() {
         unsafe { f(handle, prime.as_mut_ptr().cast(), 10444) };
         let mut orig = prime.clone();
         let st_before = gpu.thermal_channel_status(channel_mask);
-        println!("  [before] status ch{ch} = {:?}", st_before.as_ref().ok().and_then(|s| s.get(ch)));
+        println!(
+            "  [before] status ch{ch} = {:?}",
+            st_before.as_ref().ok().and_then(|s| s.get(ch))
+        );
         // 值：entry_ch + 84（绝对）
         let vo = 84 + 108 * ch;
         let q8 = (celsius * 256.0) as i32;
@@ -320,8 +362,14 @@ fn thermal_channel_probe() {
             "  SET={st_set} [mid] status ch{ch} = {:?} {}",
             st_mid.as_ref().ok().and_then(|s| s.get(ch)),
             if let Some(t) = st_mid.as_ref().ok().and_then(|s| s.get(ch)) {
-                if (t - celsius).abs() < 1.0 { "<— CONSUMED" } else { "(no follow)" }
-            } else { "" }
+                if (t - celsius).abs() < 1.0 {
+                    "<— CONSUMED"
+                } else {
+                    "(no follow)"
+                }
+            } else {
+                ""
+            }
         );
         // 还原：全缓冲 SET 回
         let st_rst = unsafe { set_f(handle, orig.as_mut_ptr().cast(), 10444) } as i32;
@@ -339,153 +387,174 @@ fn thermal_channel_probe() {
             "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected) same_check={same}",
             st_after.as_ref().ok().and_then(|s| s.get(ch))
         );
-    if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
-        // ---- ⑦d mVolt 精确 SET 配方（T6c -9 判决后重写，2026-11-15 全链 RE 定案）
-        // mVolt 0.50.13 全链（sub_140219B60 / 14021A360 / 1401D32C0:22 / 140219C90）：
-        //   · GET/SET 共用同一 10444B 自描述缓冲：ver@0=0x328CC、mask@+8、
-        //     六映射通道 dword_1403746B0=[1,3,4,5,2,0] 的 entry+8=marker
-        //     （GET 请求=0x13579BDF / SET 请求=0x2468ACE0；未设置槽回显哨兵）。
-        //   · SET = SET-marker GET 响应就地 patch：触达通道 applied@entry+4=1、
-        //     value@entry+8=Q8、未触达 sentinel→0、mask@+8=触达位图
-        //     （case 22 客户端校验 mask ⊆ 0x3F、ch_class∈1..5、applied∈{0,1}）。
-        //   · 真正下发 = SetControl(0x8DF19FA2) 两参 (handle, buf)。
-        //   · 124B 结构体（sub_140219C90 v42）= 期望状态验证模板，不发驱动
-        //     —— T6c -9 的根因。
-        println!("=== [T6d] mVolt-exact SET: 10444B in-place patch ===");
-        let set_f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
-            Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
-            },
-            _ => {
-                println!("  QueryInterface(SetControl) FAILED");
+        if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
+            // ---- ⑦d mVolt 精确 SET 配方（T6c -9 判决后重写，2026-11-15 全链 RE 定案）
+            // mVolt 0.50.13 全链（sub_140219B60 / 14021A360 / 1401D32C0:22 / 140219C90）：
+            //   · GET/SET 共用同一 10444B 自描述缓冲：ver@0=0x328CC、mask@+8、
+            //     六映射通道 dword_1403746B0=[1,3,4,5,2,0] 的 entry+8=marker
+            //     （GET 请求=0x13579BDF / SET 请求=0x2468ACE0；未设置槽回显哨兵）。
+            //   · SET = SET-marker GET 响应就地 patch：触达通道 applied@entry+4=1、
+            //     value@entry+8=Q8、未触达 sentinel→0、mask@+8=触达位图
+            //     （case 22 客户端校验 mask ⊆ 0x3F、ch_class∈1..5、applied∈{0,1}）。
+            //   · 真正下发 = SetControl(0x8DF19FA2) 两参 (handle, buf)。
+            //   · 124B 结构体（sub_140219C90 v42）= 期望状态验证模板，不发驱动
+            //     —— T6c -9 的根因。
+            println!("=== [T6d] mVolt-exact SET: 10444B in-place patch ===");
+            let set_f = match nvapi::sys::nvapi_QueryInterface(0x8DF19FA2) {
+                Ok(p) if !p.is_null() => unsafe {
+                    core::mem::transmute::<
+                        *mut core::ffi::c_void,
+                        unsafe extern "C" fn(
+                            nvapi::sys::handles::NvPhysicalGpuHandle,
+                            *mut core::ffi::c_void,
+                            usize,
+                        ) -> nvapi::sys::NvAPI_Status,
+                    >(p)
+                },
+                _ => {
+                    println!("  QueryInterface(SetControl) FAILED");
+                    return;
+                }
+            };
+            let get_f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
+                Ok(p) if !p.is_null() => unsafe {
+                    core::mem::transmute::<
+                        *mut core::ffi::c_void,
+                        unsafe extern "C" fn(
+                            nvapi::sys::handles::NvPhysicalGpuHandle,
+                            *mut core::ffi::c_void,
+                            usize,
+                        ) -> nvapi::sys::NvAPI_Status,
+                    >(p)
+                },
+                _ => {
+                    println!("  QueryInterface(GetControl) FAILED");
+                    return;
+                }
+            };
+            let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let celsius: f32 = std::env::var("NVOC_THERM_SIM_CELSIUS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30.0);
+            let map = [1usize, 3, 4, 5, 2, 0]; // 输入 0..5 → 驱动通道（全 ⊆ 0x3F）
+            if !map.contains(&ch) {
+                println!("  ch{ch} not in settable map [1,3,4,5,2,0] — abort");
                 return;
             }
-        };
-        let get_f = match nvapi::sys::nvapi_QueryInterface(0xA933CE98) {
-            Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<*mut core::ffi::c_void,
-                    unsafe extern "C" fn(nvapi::sys::handles::NvPhysicalGpuHandle, *mut core::ffi::c_void, usize) -> nvapi::sys::NvAPI_Status>(p)
-            },
-            _ => {
-                println!("  QueryInterface(GetControl) FAILED");
-                return;
+            // ① SET-marker GET prime（mask=63 优先 —— mVolt obj+28 重试链的终态；回退 0x1cfff）
+            let prime = |mask: u32| -> (i32, Vec<u8>) {
+                let mut b = vec![0u8; 10444];
+                b[0..4].copy_from_slice(&0x0003_28CCu32.to_le_bytes());
+                b[8..12].copy_from_slice(&mask.to_le_bytes());
+                for &dc in &map {
+                    let o = 84 + 108 * dc;
+                    b[o..o + 4].copy_from_slice(&0x2468_ACE0u32.to_le_bytes());
+                }
+                let st = unsafe { get_f(handle, b.as_mut_ptr().cast(), 10444) } as i32;
+                (st, b)
+            };
+            let (st63, mut buf) = prime(63);
+            let mut work_mask = 63u32;
+            if st63 != 0 {
+                let (st1c, b2) = prime(0x1cfff);
+                println!("  SET-marker GET mask=63 st={st63} → fallback 0x1cfff st={st1c}");
+                if st1c != 0 {
+                    println!("  both SET-marker GET masks refused — abort");
+                    return;
+                }
+                buf = b2;
+                work_mask = 0x1cfff;
+            } else {
+                println!("  SET-marker GET mask=63 st=0");
             }
-        };
-        let ch: usize = std::env::var("NVOC_THERM_CHANNEL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
-        let celsius: f32 = std::env::var("NVOC_THERM_SIM_CELSIUS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30.0);
-        let map = [1usize, 3, 4, 5, 2, 0]; // 输入 0..5 → 驱动通道（全 ⊆ 0x3F）
-        if !map.contains(&ch) {
-            println!("  ch{ch} not in settable map [1,3,4,5,2,0] — abort");
-            return;
-        }
-        // ① SET-marker GET prime（mask=63 优先 —— mVolt obj+28 重试链的终态；回退 0x1cfff）
-        let prime = |mask: u32| -> (i32, Vec<u8>) {
-            let mut b = vec![0u8; 10444];
-            b[0..4].copy_from_slice(&0x0003_28CCu32.to_le_bytes());
-            b[8..12].copy_from_slice(&mask.to_le_bytes());
-            for &dc in &map {
-                let o = 84 + 108 * dc;
-                b[o..o + 4].copy_from_slice(&0x2468_ACE0u32.to_le_bytes());
-            }
-            let st = unsafe { get_f(handle, b.as_mut_ptr().cast(), 10444) } as i32;
-            (st, b)
-        };
-        let (st63, mut buf) = prime(63);
-        let mut work_mask = 63u32;
-        if st63 != 0 {
-            let (st1c, b2) = prime(0x1cfff);
-            println!("  SET-marker GET mask=63 st={st63} → fallback 0x1cfff st={st1c}");
-            if st1c != 0 {
-                println!("  both SET-marker GET masks refused — abort");
-                return;
-            }
-            buf = b2;
-            work_mask = 0x1cfff;
-        } else {
-            println!("  SET-marker GET mask=63 st=0");
-        }
-        // 哨兵回显计数（协议证明：未设置槽 = 驱动回显 0x2468ACE0）
-        let sentinel = 0x2468_ACE0u32.to_le_bytes();
-        let echoed = map
-            .iter()
-            .filter(|&&dc| buf[84 + 108 * dc..84 + 108 * dc + 4] == sentinel)
-            .count();
-        println!("  sentinel echo: {echoed}/6 mapped channels = 0x2468ACE0 (expect 6 on clean state)");
-        let entry_of = |dc: usize| 76 + 108 * dc;
-        println!("  [pre] mapped ch → applied@+4 / value@+8:");
-        for (inp, &dc) in map.iter().enumerate() {
-            let e = entry_of(dc);
+            // 哨兵回显计数（协议证明：未设置槽 = 驱动回显 0x2468ACE0）
+            let sentinel = 0x2468_ACE0u32.to_le_bytes();
+            let echoed = map
+                .iter()
+                .filter(|&&dc| buf[84 + 108 * dc..84 + 108 * dc + 4] == sentinel)
+                .count();
             println!(
-                "    in{inp}->ch{dc}: class={} applied={} value={}",
-                u32::from_le_bytes(buf[e..e + 4].try_into().unwrap()),
-                buf[e + 4],
-                i32::from_le_bytes(buf[e + 8..e + 12].try_into().unwrap()),
+                "  sentinel echo: {echoed}/6 mapped channels = 0x2468ACE0 (expect 6 on clean state)"
+            );
+            let entry_of = |dc: usize| 76 + 108 * dc;
+            println!("  [pre] mapped ch → applied@+4 / value@+8:");
+            for (inp, &dc) in map.iter().enumerate() {
+                let e = entry_of(dc);
+                println!(
+                    "    in{inp}->ch{dc}: class={} applied={} value={}",
+                    u32::from_le_bytes(buf[e..e + 4].try_into().unwrap()),
+                    buf[e + 4],
+                    i32::from_le_bytes(buf[e + 8..e + 12].try_into().unwrap()),
+                );
+            }
+            // ② patch：触达通道 applied=1 + Q8 值；未触达 sentinel→0；mask=触达位图
+            let q8 = (celsius * 256.0) as i32;
+            for &dc in &map {
+                let e = entry_of(dc);
+                if dc == ch {
+                    buf[e + 4] = 1;
+                    buf[e + 8..e + 12].copy_from_slice(&q8.to_le_bytes());
+                } else if buf[e + 8..e + 12] == sentinel {
+                    buf[e + 8..e + 12].copy_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            let touch = 1u32 << ch;
+            buf[8..12].copy_from_slice(&touch.to_le_bytes());
+            println!("  touch ch{ch}: applied=1 value={q8} mask={touch:#x}");
+            // ③ SET（写面 = SetControl 两参）
+            let st_set = unsafe { set_f(handle, buf.as_mut_ptr().cast(), 10444) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            // ④ 验证三面：Status 跟随 / SET 视图保留 / GET 视图激活
+            let st_now = gpu.thermal_channel_status(channel_mask);
+            let followed = st_now
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get(ch))
+                .map(|t| (t - celsius).abs() < 1.5)
+                .unwrap_or(false);
+            println!(
+                "  SET={st_set} [mid] status ch{ch} = {:?} {}",
+                st_now.as_ref().ok().and_then(|s| s.get(ch)),
+                if followed {
+                    "<— CONSUMED"
+                } else {
+                    "(no follow)"
+                }
+            );
+            let (_, sview) = prime(work_mask);
+            let e = entry_of(ch);
+            println!(
+                "  [retain] SET-view ch{ch}: applied={} value={} (requested applied=1 value={q8})",
+                sview[e + 4],
+                i32::from_le_bytes(sview[e + 8..e + 12].try_into().unwrap()),
+            );
+            // ⑤ 还原：applied=0 + value=0 → 真传感器恢复
+            let (_, mut rst) = prime(work_mask);
+            for &dc in &map {
+                let e2 = entry_of(dc);
+                if dc == ch {
+                    rst[e2 + 4] = 0;
+                    rst[e2 + 8..e2 + 12].copy_from_slice(&0u32.to_le_bytes());
+                } else if rst[e2 + 8..e2 + 12] == sentinel {
+                    rst[e2 + 8..e2 + 12].copy_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            rst[8..12].copy_from_slice(&touch.to_le_bytes());
+            let st_rst = unsafe { set_f(handle, rst.as_mut_ptr().cast(), 10444) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let st_after = gpu.thermal_channel_status(channel_mask);
+            println!(
+                "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected)",
+                st_after.as_ref().ok().and_then(|s| s.get(ch))
+            );
+        } else {
+            println!(
+                "write arm skipped — set NVOC_ALLOW_THERM_WRITE=1 (+NVOC_THERM_CHANNEL, NVOC_THERM_SIM_CELSIUS)"
             );
         }
-        // ② patch：触达通道 applied=1 + Q8 值；未触达 sentinel→0；mask=触达位图
-        let q8 = (celsius * 256.0) as i32;
-        for &dc in &map {
-            let e = entry_of(dc);
-            if dc == ch {
-                buf[e + 4] = 1;
-                buf[e + 8..e + 12].copy_from_slice(&q8.to_le_bytes());
-            } else if buf[e + 8..e + 12] == sentinel {
-                buf[e + 8..e + 12].copy_from_slice(&0u32.to_le_bytes());
-            }
-        }
-        let touch = 1u32 << ch;
-        buf[8..12].copy_from_slice(&touch.to_le_bytes());
-        println!("  touch ch{ch}: applied=1 value={q8} mask={touch:#x}");
-        // ③ SET（写面 = SetControl 两参）
-        let st_set = unsafe { set_f(handle, buf.as_mut_ptr().cast(), 10444) } as i32;
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        // ④ 验证三面：Status 跟随 / SET 视图保留 / GET 视图激活
-        let st_now = gpu.thermal_channel_status(channel_mask);
-        let followed = st_now
-            .as_ref()
-            .ok()
-            .and_then(|s| s.get(ch))
-            .map(|t| (t - celsius).abs() < 1.5)
-            .unwrap_or(false);
-        println!(
-            "  SET={st_set} [mid] status ch{ch} = {:?} {}",
-            st_now.as_ref().ok().and_then(|s| s.get(ch)),
-            if followed { "<— CONSUMED" } else { "(no follow)" }
-        );
-        let (_, sview) = prime(work_mask);
-        let e = entry_of(ch);
-        println!(
-            "  [retain] SET-view ch{ch}: applied={} value={} (requested applied=1 value={q8})",
-            sview[e + 4],
-            i32::from_le_bytes(sview[e + 8..e + 12].try_into().unwrap()),
-        );
-        // ⑤ 还原：applied=0 + value=0 → 真传感器恢复
-        let (_, mut rst) = prime(work_mask);
-        for &dc in &map {
-            let e2 = entry_of(dc);
-            if dc == ch {
-                rst[e2 + 4] = 0;
-                rst[e2 + 8..e2 + 12].copy_from_slice(&0u32.to_le_bytes());
-            } else if rst[e2 + 8..e2 + 12] == sentinel {
-                rst[e2 + 8..e2 + 12].copy_from_slice(&0u32.to_le_bytes());
-            }
-        }
-        rst[8..12].copy_from_slice(&touch.to_le_bytes());
-        let st_rst = unsafe { set_f(handle, rst.as_mut_ptr().cast(), 10444) } as i32;
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        let st_after = gpu.thermal_channel_status(channel_mask);
-        println!(
-            "  restore SET={st_rst} [after] status ch{ch} = {:?} (real-sensor resume expected)",
-            st_after.as_ref().ok().and_then(|s| s.get(ch))
-        );
-    } else {
-        println!("write arm skipped — set NVOC_ALLOW_THERM_WRITE=1 (+NVOC_THERM_CHANNEL, NVOC_THERM_SIM_CELSIUS)");
     }
-}}
+}

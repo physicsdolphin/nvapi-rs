@@ -1821,6 +1821,31 @@ impl Gpu {
         self.gpu.thermal_channel_status(channel_mask)
     }
 
+    /// ThermChannel CONTROL state (the writable half of the temperature-sim
+    /// input lane; 10444 B version-3 self-describing buffer). See
+    /// [`PhysicalGpu::thermal_channel_control`](crate::PhysicalGpu::thermal_channel_control).
+    pub fn thermal_channel_control(
+        &self,
+        channel_mask: u32,
+    ) -> crate::Result<crate::sys::gpu::thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL>
+    {
+        self.gpu.thermal_channel_control(channel_mask)
+    }
+
+    /// Arm one channel's temperature-sim input (mVolt+ 0.50.13 exact recipe;
+    /// standalone verified on 5060 Ti / 621.24). See
+    /// [`PhysicalGpu::set_thermal_channel_sim_temp`](crate::PhysicalGpu::set_thermal_channel_sim_temp)
+    /// for the safety contract.
+    pub fn set_thermal_channel_sim_temp(&self, channel: usize, celsius: f32) -> crate::Result<()> {
+        self.gpu.set_thermal_channel_sim_temp(channel, celsius)
+    }
+
+    /// Restore temperature-sim inputs to "follow the real sensor". See
+    /// [`PhysicalGpu::clear_thermal_channel_sim_temps`](crate::PhysicalGpu::clear_thermal_channel_sim_temps).
+    pub fn clear_thermal_channel_sim_temps(&self, channel_mask: u32) -> crate::Result<()> {
+        self.gpu.clear_thermal_channel_sim_temps(channel_mask)
+    }
+
     pub fn set_cooler_levels<I: IntoIterator<Item = (FanCoolerId, CoolerSettings)>>(
         &self,
         levels: I,

@@ -259,7 +259,9 @@ fn vfe_v2_tier_probe() {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        println!("=== [WRITE] var{idx} single-var SET + auto-restore (gate NVOC_ALLOW_VFE_VAR0_WRITE) ===");
+        println!(
+            "=== [WRITE] var{idx} single-var SET + auto-restore (gate NVOC_ALLOW_VFE_VAR0_WRITE) ==="
+        );
         use nvapi::sys::api::{NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
         let value: f32 = std::env::var("NVOC_VFE_VAR0_VALUE_UV")
             .ok()
@@ -745,7 +747,11 @@ fn vfe_v2_tier_probe() {
             for (i, w) in b[base..base + 276].chunks_exact(4).enumerate() {
                 let v = u32::from_le_bytes(w.try_into().unwrap());
                 if v != 0 {
-                    fields.push(format!("+{:03X}:{v:#010x}(lo16 {:#06x})", i * 4, v & 0xFFFF));
+                    fields.push(format!(
+                        "+{:03X}:{v:#010x}(lo16 {:#06x})",
+                        i * 4,
+                        v & 0xFFFF
+                    ));
                 }
             }
             println!("  entry{k}@{base:X}: type={t} {}", fields.join(" "));
@@ -787,7 +793,11 @@ fn vfe_v2_tier_probe() {
                 let v = u32::from_le_bytes(w.try_into().unwrap());
                 if v != 0 {
                     let f = f32::from_le_bytes(v.to_le_bytes());
-                    fields.push(format!("+{:02X}:{v:#010x}(f32 {f:.3?}){}", i * 4, wall_tag(f)));
+                    fields.push(format!(
+                        "+{:02X}:{v:#010x}(f32 {f:.3?}){}",
+                        i * 4,
+                        wall_tag(f)
+                    ));
                 }
             }
             println!("  var{idx} factory@{rec}: {}", fields.join(" "));
@@ -1185,9 +1195,16 @@ fn vfe_v2_tier_probe() {
     // 修正:V10 的 rec+148/rec+152 为双重累加错偏(mVolt 绝对偏移 160*v+108/112/148/152
     // 应落 rec+4/8/44/48);V10 未曾运行。本臂:每候选 var x {verbatim+20000uV,
     // verbatim+20(mV 释义)} 逐一 SET+还原验证,+全组 7 var 批量 SET,墙值三查+移动检测。
-    if std::env::var("NVOC_ALLOW_VFE_VAR0_WRITE").is_ok() && std::env::var("NVOC_VFE_MVOLT_FLOW").is_ok() {
-        println!("=== [V11] gate-matrix batch: sig vars [4,5,11,12,13,19,50] x (verbatim uV/mV) + group batch SET ===");
-        use nvapi::sys::api::{NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl, NvAPI_GPU_PerfVfeVarSetControl};
+    if std::env::var("NVOC_ALLOW_VFE_VAR0_WRITE").is_ok()
+        && std::env::var("NVOC_VFE_MVOLT_FLOW").is_ok()
+    {
+        println!(
+            "=== [V11] gate-matrix batch: sig vars [4,5,11,12,13,19,50] x (verbatim uV/mV) + group batch SET ==="
+        );
+        use nvapi::sys::api::{
+            NvAPI_GPU_PerfVfeEquGetControl, NvAPI_GPU_PerfVfeVarGetControl,
+            NvAPI_GPU_PerfVfeVarSetControl,
+        };
         let candidates = [4usize, 5, 11, 12, 13, 19, 50];
         let walls = || -> [i32; 6] {
             gpu.volt_rails()
@@ -1214,7 +1231,8 @@ fn vfe_v2_tier_probe() {
         // ①6220B 第二对象 GET(stamp 137292 —— 接口归属未证实,用 VarGetControl 入口探)
         let mut st6220 = vec![0u8; 6220];
         st6220[0..4].copy_from_slice(&137292u32.to_le_bytes());
-        let st6 = unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, st6220.as_mut_ptr().cast()) } as i32;
+        let st6 =
+            unsafe { NvAPI_GPU_PerfVfeVarGetControl(handle, st6220.as_mut_ptr().cast()) } as i32;
         println!(
             "  [6220B] st={st6} nz={} head={:?}",
             nonzero_dwords(&st6220, usize::MAX).len(),
@@ -1223,7 +1241,11 @@ fn vfe_v2_tier_probe() {
         let ident0 = get_ident();
         let probe0 = get_ctrl(&ident0);
         println!("  [ident32 echo@4..36] {:?}", &probe0[4..36]);
-        println!("  [rec4 dump] type={} rec@744 bytes[0..16]={:?}", u32::from_le_bytes(probe0[744..748].try_into().unwrap()), &probe0[744..760]);
+        println!(
+            "  [rec4 dump] type={} rec@744 bytes[0..16]={:?}",
+            u32::from_le_bytes(probe0[744..748].try_into().unwrap()),
+            &probe0[744..760]
+        );
 
         let mut moved: Vec<String> = Vec::new();
         let mut aborted = false;
@@ -1243,7 +1265,8 @@ fn vfe_v2_tier_probe() {
                 req[rec + 8..rec + 12].copy_from_slice(&value.max(0.0).to_le_bytes());
                 req[rec + 44] = 1;
                 req[rec + 48..rec + 52].copy_from_slice(&value.to_le_bytes());
-                let st_s = unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
+                let st_s =
+                    unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
                 std::thread::sleep(std::time::Duration::from_millis(600));
                 let back = get_ctrl(&ident);
                 let rd_ap = back[rec + 44];
@@ -1285,7 +1308,8 @@ fn vfe_v2_tier_probe() {
                 req[rec + 44] = 1;
                 req[rec + 48..rec + 52].copy_from_slice(&20000.0f32.to_le_bytes());
             }
-            let st_s = unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
+            let st_s =
+                unsafe { NvAPI_GPU_PerfVfeVarSetControl(handle, req.as_ptr().cast()) } as i32;
             std::thread::sleep(std::time::Duration::from_millis(800));
             let w_mid = walls();
             let rst = get_ctrl(&ident);

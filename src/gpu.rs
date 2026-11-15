@@ -7406,45 +7406,46 @@ impl PhysicalGpu {
 
     /// Apply one channel's temperature-sim override (the read half is primed
     /// from live state so opaque fields survive). `celsius` is the simulated
-    /// reading for `channel`; pass the current real temp (or 0.0 to clear the
-    /// override and follow the real sensor).
+    /// reading for `channel` (channels 0..=5 only — the six UI-mappable set
+    /// `dword_1403746B0=[1,3,4,5,2,0]`); pass the current real temp (or 0.0
+    /// with [`Self::clear_thermal_channel_sim_temps`]) to follow the sensor.
     ///
     /// Uses the PRIVATE ThermChannel RMW pair (GET 0xa933ce98 +
-    /// SET 0x8df19fa2, 10444 B version-3 control). **This lane WORKS on
-    /// RTX 5060 Ti / 621.24** — the same driver where the voltage VFE
-    /// override lane is retain-but-never-consumed — making it the first
-    /// confirmed writable thermal surface on Blackwell+621.
+    /// SET 0x8df19fa2, 10444 B version-3 control) with the mVolt+ 0.50.13
+    /// exact apply recipe (reverse-engineered sub_14021A360, probe T6d):
+    /// prime with mask 0x3F, patch applied@entry+4 + value@entry+8, then
+    /// SET with `channel_mask = touched bitmap` (⊆ 0x3F). **This lane WORKS
+    /// standalone on RTX 5060 Ti / 621.24** — probe T6d CONSUMED (Status
+    /// pinned exactly, retain verified, restore clean) in default state
+    /// with no mVolt arming — making it the first confirmed writable
+    /// thermal surface on Blackwell+621.
     ///
     /// # Safety contract
     /// NDA write path. The caller is responsible for restoring the previous
     /// sim value (capture with [`Self::thermal_channel_control`] before
     /// patching); sim temps alter DVFS/thermal behavior (the mVolt+ "LN2"
     /// workflow exists because a cold-reported GPU boosts harder).
-    pub fn set_thermal_channel_sim_temp(
-        &self,
-        channel: usize,
-        celsius: f32,
-    ) -> crate::Result<()> {
+    pub fn set_thermal_channel_sim_temp(&self, channel: usize, celsius: f32) -> crate::Result<()> {
         trace!("gpu.set_thermal_channel_sim_temp(ch{channel}, {celsius} C)");
-        let info = self.thermal_channel_info().map_err(crate::Error::from)?;
-        let mask = info.channel_mask;
-        if mask & (1u32 << channel) == 0 {
+        if channel >= 6 {
             return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
                 channel as i64,
             )));
         }
-        // GET-prime: live control state (opaque fields preserved).
-        let mut data = self.thermal_channel_control(mask).map_err(crate::Error::from)?;
-        // Patch the sim override for this channel (Q8).
+        // Prime from the SET-marker view (mask 0x3F = mVolt's cached retry
+        // mask; the wide info mask reads fine but the SET handler consumes
+        // mask@+8 as the touched-channel bitmap).
+        let mut data = self
+            .thermal_channel_control(0x3F)
+            .or_else(|_| self.thermal_channel_control(0x1cfff))
+            .map_err(crate::Error::from)?;
+        // Patch: applied@entry+4 + value@entry+8 (Q8). The T7-era empirical
+        // 0x2F/0x65/0x80 byte writes were driver-side echoes, not request
+        // fields — dropped with the T6d verdict.
         data.set_sim_temp_q8(channel, (celsius * 256.0) as i32);
-        // Apply the mVolt+-empirical enable recipe (live-diffed 5060 Ti /
-        // 621.24, T7): three live-enable bytes (0x2F/0x65/0x80) flip 0->1 on
-        // every apply, and the per-input applied flag sits at entry_k+80.
-        // Without these the SET is accepted-but-ignored (T6 first attempt).
-        data.raw_mut()[0x2F] = 1;
-        data.raw_mut()[0x65] = 1;
-        data.raw_mut()[0x80] = 1;
         data.set_applied_flag(channel);
+        // mask@+8 = touched bitmap (nonzero, subset of 0x3F).
+        data.channel_mask = 1u32 << channel;
         // SET: apply the patched buffer.
         unsafe {
             let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, &mut data);
@@ -7467,19 +7468,29 @@ impl PhysicalGpu {
         Ok(())
     }
 
-    /// Restore every channel's sim override to "follow the real sensor"
-    /// (sim_temp_q8 = 0) for all channels in `channel_mask`. Use after
-    /// [`Self::set_thermal_channel_sim_temp`] experiments.
+    /// Restore channels in `channel_mask` to "follow the real sensor"
+    /// (applied = 0, sim_temp_q8 = 0). Only the six settable channels
+    /// (0..=5) are addressable — same contract as
+    /// [`Self::set_thermal_channel_sim_temp`]. Use after experiments.
     pub fn clear_thermal_channel_sim_temps(&self, channel_mask: u32) -> crate::Result<()> {
         trace!("gpu.clear_thermal_channel_sim_temps(0x{channel_mask:x})");
+        let mask = channel_mask & 0x3F;
+        if mask == 0 {
+            return Err(crate::Error::ArgumentRange(sys::ArgumentRangeError::new(
+                channel_mask as i64,
+            )));
+        }
         let mut data = self
-            .thermal_channel_control(channel_mask)
+            .thermal_channel_control(0x3F)
+            .or_else(|_| self.thermal_channel_control(0x1cfff))
             .map_err(crate::Error::from)?;
-        for ch in 0..thermal::undocumented::NV_GPU_THERMAL_THERM_CHANNEL_CONTROL_MAX {
-            if channel_mask & (1u32 << ch) != 0 {
+        for ch in 0..6 {
+            if mask & (1u32 << ch) != 0 {
+                data.entry[ch].applied = 0;
                 data.entry[ch].sim_temp_q8 = 0;
             }
         }
+        data.channel_mask = mask;
         unsafe {
             let st = sys::api::NvAPI_GPU_ThermChannelSetControl(self.0, &mut data);
             crate::status_result(sys::Api::NvAPI_GPU_ThermChannelSetControl, st)?;
