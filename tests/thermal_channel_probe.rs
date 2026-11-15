@@ -1756,6 +1756,74 @@ fn thermal_channel_probe() {
         }
     }
 
+    // ---- ⑩T17: C 读出的正式 QI 入口——0x4A82C2B1 ----
+    // IDA 复核（nvapi64_impl.dll 621.01）：nvapi64.dll 是 shim（静态表 4 项，
+    // miss 后 LoadLibrary nvapi64_impl.dll 取它的 nvapi_QueryInterface 兜底）；
+    // impl 的 QI 表 ID 明文存储。sub_180154620（id 0x4A82C2B1）= C 读出包装器：
+    // (handle, mask, out*)，out[0] 预置 0x10014，内部走 cmd 0x0700002F。
+    // 同表邻居（热策略 impl 族）：0x4085DE45 / 0x172409B4 / 0x0E45002D /
+    // 0x95B64341 / 0xF5A0F22C / 0x9FB063DF。
+    println!("=== [T17] QI 0x4A82C2B1 (impl C readout wrapper) ===");
+    {
+        if let Some(f) = resolve14(0x4A82C2B1) {
+            println!("  QueryInterface 0x4A82C2B1: OK");
+            type Wrapper17 = unsafe extern "C" fn(
+                nvapi::sys::handles::NvPhysicalGpuHandle,
+                u32,
+                *mut u32,
+            ) -> i32;
+            let wrap: Wrapper17 = unsafe { core::mem::transmute(f) };
+            for &mask in &[1u32, 0x5u32] {
+                let mut out = vec![0u32; 1024];
+                out[0] = 0x10014;
+                out[1] = 1440;
+                let st = unsafe { wrap(handle, mask, out.as_mut_ptr()) };
+                println!(
+                    "  mask={mask:#x}: st={st} (out[0]={:#x} out[1]={:#x})",
+                    out[0], out[1]
+                );
+                // 产物扫描：找 C 布局特征（mask@+8、entries @32+88i id=4）
+                let nz: Vec<(usize, u32)> = out
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, v)| v != 0)
+                    .take(40)
+                    .collect();
+                println!(
+                    "  nonzero: {}",
+                    nz.iter()
+                        .map(|(k, v)| format!("[{k}]={v:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let cmask = out[2];
+                for i in 0..16usize {
+                    if cmask & (1 << i) == 0 {
+                        continue;
+                    }
+                    let base = 8 + 22 * i; // entry byte 32+88i → dword 8+22i
+                    if base + 22 > out.len() {
+                        break;
+                    }
+                    let id = out[base] & 0xFF;
+                    if id != 4 {
+                        continue;
+                    }
+                    let temp = out[base + 1];
+                    let flag = out[base + 21] & 0xFF;
+                    println!(
+                        "  C slot{i}: id=4 temp={:.2}C remove_tdp={}",
+                        (temp as i32) as f32 / 256.0,
+                        flag == 1
+                    );
+                }
+            }
+        } else {
+            println!("  QueryInterface 0x4A82C2B1 FAILED — id not in this build's QI table");
+        }
+    }
+
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
     println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
     let info1 = pol_get(0x0D258BB5, (3 << 16) | 1400, info_len);
