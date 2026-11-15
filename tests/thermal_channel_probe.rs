@@ -293,6 +293,101 @@ fn thermal_channel_probe() {
         println!("  SetControl-id as GET marker=0x13579BDF: st={st}");
     }
 
+    // ---- ⑤T8 Thermal limits（ClientThermalPolicies 族，全 GET）----
+    // mVolt "Thermal limits" 面板（GPU/Hotspot/Memory 三槽 + Include + 总闸）的
+    // 活体判定臂：静态槽表 + 原始 TARGET_STATUS(984B ver2, 0xC4554575) 逐槽 dump
+    // + 15s 轮询 diff（用户操作面板 → 变动 dword = 真字段）。
+    println!("=== [T8] Thermal limits: ClientThermalPolicies ===");
+    match gpu.target_temp_policy_index() {
+        Ok(Some(idx)) => println!("  private GetInfo: GPS/target-temp policy idx = {idx}"),
+        Ok(None) => println!("  private GetInfo: no GPS/acoustics index exposed"),
+        Err(e) => println!("  private GetInfo (0x2F69F8E5) failed: {e:?}"),
+    }
+    let slots = gpu
+        .target_temperature_policies_with_info()
+        .unwrap_or_default();
+    if slots.is_empty() {
+        println!("  no target-temp policy slots exposed (desktop-typical)");
+    }
+    for e in &slots {
+        println!(
+            "  slot {}: cur={} min={:?} default={:?} max={:?}",
+            e.policy_index, e.current, e.min, e.default, e.max
+        );
+    }
+    // 原始 TARGET_STATUS 逐槽快照（单 bit 掩码 GET），供 T8c 轮询 diff。
+    let target_get = |idx: usize| -> Option<Vec<u8>> {
+        let f = nvapi::sys::nvapi_QueryInterface(0xC4554575).ok()?;
+        if f.is_null() {
+            return None;
+        }
+        let f = unsafe {
+            core::mem::transmute::<
+                *mut core::ffi::c_void,
+                unsafe extern "C" fn(
+                    nvapi::sys::handles::NvPhysicalGpuHandle,
+                    *mut core::ffi::c_void,
+                    usize,
+                ) -> nvapi::sys::NvAPI_Status,
+            >(f)
+        };
+        let mut b = vec![0u8; 984];
+        b[0..4].copy_from_slice(&0x0002_03D8u32.to_le_bytes()); // v2|984
+        b[4..8].copy_from_slice(&(1u32 << idx).to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), 984) } as i32;
+        if st == 0 { Some(b) } else { None }
+    };
+    let poll_slots: Vec<usize> = slots.iter().map(|e| e.policy_index).collect();
+    if !poll_slots.is_empty() {
+        println!("  --- T8 raw entry dumps (60B each, nonzero dwords) ---");
+        let mut base: Vec<(usize, Vec<u8>)> = Vec::new();
+        for &idx in &poll_slots {
+            if let Some(b) = target_get(idx) {
+                let off = 20 + 60 * idx; // payload temp-base = dword7 - 8B header
+                let e = &b[off..off + 60];
+                let nz: Vec<String> = e
+                    .chunks_exact(4)
+                    .enumerate()
+                    .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                    .map(|(k, w)| {
+                        format!("d{k}={:#010x}", u32::from_le_bytes(w.try_into().unwrap()))
+                    })
+                    .collect();
+                println!("  slot {idx}: {}", nz.join(" "));
+                base.push((idx, b));
+            }
+        }
+        println!("=== [T8c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
+        let mut prev = base.clone();
+        for it in 1..=60 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mut next: Vec<(usize, Vec<u8>)> = Vec::new();
+            for (idx, _) in &prev {
+                if let Some(b) = target_get(*idx) {
+                    next.push((*idx, b));
+                }
+            }
+            for (idx, old) in &prev {
+                if let Some((_, new)) = next.iter().find(|(i, _)| i == idx) {
+                    if old != new {
+                        for k in 0..old.len() / 4 {
+                            let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+                            let n = u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
+                            if o != n {
+                                println!(
+                                    "  [it{it}] slot{idx} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                                    4 + k * 4
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            prev = next;
+        }
+        println!("  (poll done — changed dwords above = the fields mVolt writes)");
+    }
+
     // ---- ⑥ 写臂（双重门控）：完整配方 = 值(entry_k+84) + 使能标志字节(47/101/128) + RMW + 全缓冲还原
     // 依据：T7 活体 diff（mVolt apply 时 CTRL +0x2F/+0x65/+0x80 置 1 + Status ch1 钉 1280=5°C）。
     if std::env::var("NVOC_ALLOW_THERM_WRITE").is_ok() {
