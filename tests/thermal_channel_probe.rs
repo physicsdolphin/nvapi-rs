@@ -428,21 +428,24 @@ fn thermal_channel_probe() {
     if let Some(b) = &info0 {
         println!("  --- INFO entries (v3, count guess via stride scan) ---");
         // INFO_V2 entry = 24B {policy_id, unknown, min, default, max, flags};
-        // V3 entry layout opaque — dump all Q8 candidates + nonzero dwords.
-        for (k, w) in b.chunks_exact(4).enumerate().skip(1) {
-            let v = u32::from_le_bytes(w.try_into().unwrap());
-            if v == 0 {
-                continue;
-            }
+        // V3 entry layout opaque — dump nonzero dwords (5060 Ti showed all-zero
+        // in the first 40; scan the WHOLE buffer).
+        let nz: Vec<(usize, u32)> = b
+            .chunks_exact(4)
+            .enumerate()
+            .skip(1)
+            .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+            .map(|(k, w)| (k, u32::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        println!("  INFO nonzero dwords: {} (of {})", nz.len(), b.len() / 4);
+        for &(k, v) in nz.iter().take(120) {
             let q8 = v as i32 as f32 / 256.0;
             let tag = if v % 4 == 0 && v < 40000 && (v as i32) > -10000 {
                 format!(" = Q8 {q8:.2}C")
             } else {
                 String::new()
             };
-            if k < 40 {
-                println!("  INFO dword{k} (abs {}): {v:#010x}{tag}", 4 + k * 4);
-            }
+            println!("  INFO dword{k} (abs {}): {v:#010x}{tag}", 4 + k * 4);
         }
     }
     if let Some(b) = &status0 {
@@ -470,10 +473,10 @@ fn thermal_channel_probe() {
     if info0.is_some() || status0.is_some() {
         println!("=== [T9c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
         let mut prev: Vec<(&str, Vec<u8>)> = Vec::new();
-        if let Some(b) = info0 {
+        if let Some(b) = info0.clone() {
             prev.push(("info", b));
         }
-        if let Some(b) = status0 {
+        if let Some(b) = status0.clone() {
             prev.push(("status", b));
         }
         for it in 1..=60 {
@@ -773,4 +776,54 @@ fn thermal_channel_probe() {
             );
         }
     }
+
+    // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
+    // 头（T9 段）尾两次 dump 的差异 = 运行期间 mVolt 真正落盘的字段。
+    println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
+    let info1 = pol_get(0x0D258BB5, (3 << 16) | 1400, info_len);
+    let status1 = pol_get(0xE9C425A1, (3 << 16) | 1352, status_len);
+    if let Some(b) = &status1 {
+        let count = u32::from_le_bytes(b[4..8].try_into().unwrap());
+        println!("  STATUS count = {count}");
+        let stride = (status_len - 8) / 4;
+        for e in 0..count as usize {
+            let s = 8 + e * stride;
+            let d: Vec<u32> = b[s..s + 16]
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            println!(
+                "  entry{e}: policy_id={} flags={:#x} temp_limit={}C remove_tdp={}",
+                d[0],
+                d[1],
+                (d[2] >> 8) as i32,
+                d[3]
+            );
+        }
+        if let Some(old) = &status0 {
+            for k in 0..old.len() / 4 {
+                let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+                let n = u32::from_le_bytes(b[k * 4..k * 4 + 4].try_into().unwrap());
+                if o != n {
+                    println!(
+                        "  STATUS dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                        4 + k * 4
+                    );
+                }
+            }
+        }
+    }
+    if let (Some(old), Some(new)) = (&info0, &info1) {
+        for k in 0..old.len() / 4 {
+            let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+            let n = u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
+            if o != n {
+                println!(
+                    "  INFO dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                    4 + k * 4
+                );
+            }
+        }
+    }
+    println!("  (T9-end done — STATUS/INFO deltas above = fields written during this run)");
 }
