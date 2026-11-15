@@ -160,79 +160,85 @@ fn thermal_channel_probe() {
     }
     // ---- ⑤b 活体轮询 diff（全 GET）：15s 高频轮询 control/info/status 三缓冲,
     // 用户期间在 mVolt UI 改模拟值 → 变动的 dword = 真字段（mVolt 实际写的地方）。
-    println!("=== [T7] live poll-diff (15s): change mVolt GPU temp NOW ===");
-    {
-        use nvapi::sys::api::{NvAPI_GPU_ThermChannelGetInfo, NvAPI_GPU_ThermChannelGetStatus};
-        use nvapi::sys::gpu::thermal::undocumented::{
-            NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2,
-            NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2,
-        };
-        let get_all = |mask: u32| -> (Vec<u8>, Vec<u8>, Vec<i32>) {
-            let mut ctrl = vec![0u8; 10444];
-            ctrl[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
-            ctrl[8..12].copy_from_slice(&mask.to_le_bytes());
-            unsafe { NvAPI_GPU_ThermChannelGetControl(handle, ctrl.as_mut_ptr().cast()) };
-            let mut inf = NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2::default();
-            inf.version = nvapi::sys::nvapi::NvVersion::new(
-                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(),
-                2,
-            );
-            unsafe { NvAPI_GPU_ThermChannelGetInfo(handle, &mut inf) };
-            let mut st = NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2::default();
-            st.version = nvapi::sys::nvapi::NvVersion::new(
-                size_of::<NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2>(),
-                2,
-            );
-            st.channel_mask = mask;
-            unsafe { NvAPI_GPU_ThermChannelGetStatus(handle, &mut st) };
-            let stv: Vec<i32> = (0..32)
-                .filter(|i| mask & (1u32 << i) != 0)
-                .filter_map(|i| st.channel.get(i).copied())
-                .collect();
-            // INFO raw bytes: walk the struct via pointer (params are repr(C) nvstruct)
-            let ibytes = unsafe {
-                core::slice::from_raw_parts(
-                    &inf as *const NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2 as *const u8,
+    if std::env::var("NVOC_THERM_POLL").is_err() {
+        println!("=== [T7] live poll-diff SKIPPED (set NVOC_THERM_POLL=1 to run) ===");
+    } else {
+        println!("=== [T7] live poll-diff (15s): change mVolt GPU temp NOW ===");
+        {
+            use nvapi::sys::api::{NvAPI_GPU_ThermChannelGetInfo, NvAPI_GPU_ThermChannelGetStatus};
+            use nvapi::sys::gpu::thermal::undocumented::{
+                NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2,
+                NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2,
+            };
+            let get_all = |mask: u32| -> (Vec<u8>, Vec<u8>, Vec<i32>) {
+                let mut ctrl = vec![0u8; 10444];
+                ctrl[0..4].copy_from_slice(&0x000328CCu32.to_le_bytes());
+                ctrl[8..12].copy_from_slice(&mask.to_le_bytes());
+                unsafe { NvAPI_GPU_ThermChannelGetControl(handle, ctrl.as_mut_ptr().cast()) };
+                let mut inf = NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2::default();
+                inf.version = nvapi::sys::nvapi::NvVersion::new(
                     size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(),
-                )
-            }
-            .to_vec();
-            (ctrl, ibytes, stv)
-        };
-        let (c0, i0, s0) = get_all(channel_mask);
-        println!(
-            "  base captured: ctrl_nz={} info_nz={} status={s0:?}",
-            nonzero_dwords(&c0, usize::MAX).len(),
-            nonzero_dwords(&i0, usize::MAX).len()
-        );
-        for it in 1..=60usize {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let (c, i, sv) = get_all(channel_mask);
-            // control diff
-            for (off, (a, b)) in c0.chunks_exact(4).zip(c.chunks_exact(4)).enumerate() {
-                if a != b {
-                    let av = u32::from_le_bytes(a.try_into().unwrap());
-                    let bv = u32::from_le_bytes(b.try_into().unwrap());
-                    println!("  [it{it}] CTRL +{off:04X}: {av:#010x} -> {bv:#010x}");
+                    2,
+                );
+                unsafe { NvAPI_GPU_ThermChannelGetInfo(handle, &mut inf) };
+                let mut st = NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2::default();
+                st.version = nvapi::sys::nvapi::NvVersion::new(
+                    size_of::<NV_GPU_THERMAL_THERM_CHANNEL_STATUS_PARAMS_V2>(),
+                    2,
+                );
+                st.channel_mask = mask;
+                unsafe { NvAPI_GPU_ThermChannelGetStatus(handle, &mut st) };
+                let stv: Vec<i32> = (0..32)
+                    .filter(|i| mask & (1u32 << i) != 0)
+                    .filter_map(|i| st.channel.get(i).copied())
+                    .collect();
+                // INFO raw bytes: walk the struct via pointer (params are repr(C) nvstruct)
+                let ibytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &inf as *const NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2 as *const u8,
+                        size_of::<NV_GPU_THERMAL_THERM_CHANNEL_INFO_PARAMS_V2>(),
+                    )
+                }
+                .to_vec();
+                (ctrl, ibytes, stv)
+            };
+            let (c0, i0, s0) = get_all(channel_mask);
+            println!(
+                "  base captured: ctrl_nz={} info_nz={} status={s0:?}",
+                nonzero_dwords(&c0, usize::MAX).len(),
+                nonzero_dwords(&i0, usize::MAX).len()
+            );
+            for it in 1..=60usize {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let (c, i, sv) = get_all(channel_mask);
+                // control diff
+                for (off, (a, b)) in c0.chunks_exact(4).zip(c.chunks_exact(4)).enumerate() {
+                    if a != b {
+                        let av = u32::from_le_bytes(a.try_into().unwrap());
+                        let bv = u32::from_le_bytes(b.try_into().unwrap());
+                        println!("  [it{it}] CTRL +{off:04X}: {av:#010x} -> {bv:#010x}");
+                    }
+                }
+                // info diff
+                for (off, (a, b)) in i0.chunks_exact(4).zip(i.chunks_exact(4)).enumerate() {
+                    if a != b {
+                        let av = u32::from_le_bytes(a.try_into().unwrap());
+                        let bv = u32::from_le_bytes(b.try_into().unwrap());
+                        println!("  [it{it}] INFO +{off:04X}: {av:#010x} -> {bv:#010x}");
+                    }
+                }
+                // status diff
+                if sv != s0 {
+                    println!("  [it{it}] STATUS: {s0:?} -> {sv:?}");
+                }
+                if it % 12 == 0 {
+                    println!("  ... polling, ch temps: {sv:?}");
                 }
             }
-            // info diff
-            for (off, (a, b)) in i0.chunks_exact(4).zip(i.chunks_exact(4)).enumerate() {
-                if a != b {
-                    let av = u32::from_le_bytes(a.try_into().unwrap());
-                    let bv = u32::from_le_bytes(b.try_into().unwrap());
-                    println!("  [it{it}] INFO +{off:04X}: {av:#010x} -> {bv:#010x}");
-                }
-            }
-            // status diff
-            if sv != s0 {
-                println!("  [it{it}] STATUS: {s0:?} -> {sv:?}");
-            }
-            if it % 12 == 0 {
-                println!("  ... polling, ch temps: {sv:?}");
-            }
+            println!(
+                "  (poll done — any CTRL/INFO lines above = the fields mVolt actually writes)"
+            );
         }
-        println!("  (poll done — any CTRL/INFO lines above = the fields mVolt actually writes)");
     }
     // ---- ②c 真 marker 协议（sub_140219C90 破译）：
     //   GetControl(handle, buf10444, 0x13579BDF)  /  SetControl(handle, buf, 0x2468ACE0)
@@ -357,35 +363,41 @@ fn thermal_channel_probe() {
                 base.push((idx, b));
             }
         }
-        println!("=== [T8c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
-        let mut prev = base.clone();
-        for it in 1..=60 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let mut next: Vec<(usize, Vec<u8>)> = Vec::new();
-            for (idx, _) in &prev {
-                if let Some(b) = target_get(*idx) {
-                    next.push((*idx, b));
+        if std::env::var("NVOC_THERM_POLL").is_err() {
+            println!("=== [T8c] live poll-diff SKIPPED (set NVOC_THERM_POLL=1) ===");
+        } else {
+            println!("=== [T8c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
+            let mut prev = base.clone();
+            for it in 1..=60 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let mut next: Vec<(usize, Vec<u8>)> = Vec::new();
+                for (idx, _) in &prev {
+                    if let Some(b) = target_get(*idx) {
+                        next.push((*idx, b));
+                    }
                 }
-            }
-            for (idx, old) in &prev {
-                if let Some((_, new)) = next.iter().find(|(i, _)| i == idx) {
-                    if old != new {
-                        for k in 0..old.len() / 4 {
-                            let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
-                            let n = u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
-                            if o != n {
-                                println!(
-                                    "  [it{it}] slot{idx} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
-                                    4 + k * 4
-                                );
+                for (idx, old) in &prev {
+                    if let Some((_, new)) = next.iter().find(|(i, _)| i == idx) {
+                        if old != new {
+                            for k in 0..old.len() / 4 {
+                                let o =
+                                    u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+                                let n =
+                                    u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
+                                if o != n {
+                                    println!(
+                                        "  [it{it}] slot{idx} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                                        4 + k * 4
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                prev = next;
             }
-            prev = next;
+            println!("  (poll done — changed dwords above = the fields mVolt writes)");
         }
-        println!("  (poll done — changed dwords above = the fields mVolt writes)");
     }
 
     // ---- ⑤T9 Thermal limits：documented POLICIES 族（0x0D258BB5 / 0xE9C425A1）----
@@ -471,45 +483,51 @@ fn thermal_channel_probe() {
         }
     }
     if info0.is_some() || status0.is_some() {
-        println!("=== [T9c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
-        let mut prev: Vec<(&str, Vec<u8>)> = Vec::new();
-        if let Some(b) = info0.clone() {
-            prev.push(("info", b));
-        }
-        if let Some(b) = status0.clone() {
-            prev.push(("status", b));
-        }
-        for it in 1..=60 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            let mut next: Vec<(&str, Vec<u8>)> = Vec::new();
-            for (name, _) in &prev {
-                let buf = match *name {
-                    "info" => pol_get(0x0D258BB5, (3 << 16) | 1400, info_len),
-                    _ => pol_get(0xE9C425A1, (3 << 16) | 1352, status_len),
-                };
-                if let Some(b) = buf {
-                    next.push((name, b));
-                }
+        if std::env::var("NVOC_THERM_POLL").is_err() {
+            println!("=== [T9c] live poll-diff SKIPPED (set NVOC_THERM_POLL=1) ===");
+        } else {
+            println!("=== [T9c] live poll-diff (15s): operate mVolt Thermal limits NOW ===");
+            let mut prev: Vec<(&str, Vec<u8>)> = Vec::new();
+            if let Some(b) = info0.clone() {
+                prev.push(("info", b));
             }
-            for (name, old) in &prev {
-                if let Some((_, new)) = next.iter().find(|(n, _)| n == name) {
-                    if old != new {
-                        for k in 0..old.len() / 4 {
-                            let o = u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
-                            let n = u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
-                            if o != n {
-                                println!(
-                                    "  [it{it}] {name} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
-                                    4 + k * 4
-                                );
+            if let Some(b) = status0.clone() {
+                prev.push(("status", b));
+            }
+            for it in 1..=60 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let mut next: Vec<(&str, Vec<u8>)> = Vec::new();
+                for (name, _) in &prev {
+                    let buf = match *name {
+                        "info" => pol_get(0x0D258BB5, (3 << 16) | 1400, info_len),
+                        _ => pol_get(0xE9C425A1, (3 << 16) | 1352, status_len),
+                    };
+                    if let Some(b) = buf {
+                        next.push((name, b));
+                    }
+                }
+                for (name, old) in &prev {
+                    if let Some((_, new)) = next.iter().find(|(n, _)| n == name) {
+                        if old != new {
+                            for k in 0..old.len() / 4 {
+                                let o =
+                                    u32::from_le_bytes(old[k * 4..k * 4 + 4].try_into().unwrap());
+                                let n =
+                                    u32::from_le_bytes(new[k * 4..k * 4 + 4].try_into().unwrap());
+                                if o != n {
+                                    println!(
+                                        "  [it{it}] {name} dword{k} (abs {}): {o:#010x} -> {n:#010x}",
+                                        4 + k * 4
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                prev = next;
             }
-            prev = next;
+            println!("  (poll done — changed dwords above = the Thermal limits live fields)");
         }
-        println!("  (poll done — changed dwords above = the Thermal limits live fields)");
     }
 
     // ---- ⑥ 写臂（双重门控）：完整配方 = 值(entry_k+84) + 使能标志字节(47/101/128) + RMW + 全缓冲还原
