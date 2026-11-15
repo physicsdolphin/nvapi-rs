@@ -7762,6 +7762,184 @@ impl PhysicalGpu {
         Ok(out)
     }
 
+    /// Compact per-slot thermal-policy STATUS via the RM lane — the mVolt+
+    /// 0.50.13 "Thermal limits" readout, live-verified on RTX 2070/621.01 and
+    /// RTX 5060 Ti/621.24. NOT a QueryInterface surface: the transport is an
+    /// unregistered internal fn of nvapi64_impl.dll, located by scanning the
+    /// loaded module for the build-stable signature `mov ecx, 0x0700018F;
+    /// call rel32` (28 call sites converging on two transports across the
+    /// 610/621.01/621.24 builds). Request = mVolt-exact 1496 B escape:
+    /// [+48] device id (low 32 bits of the physical handle), [+52] RM control
+    /// 0x2080852C, [+64] slot mask (server validates ⊆ the armed set, taken
+    /// from PRIVATE INFO v4|15732 when available), 0xFF sentinels per 88 B
+    /// slot; response guards +44==1 / id / cmd / mask echo with the C payload
+    /// (1440 B) at +56. Returns `Ok(None)` when nvapi64_impl.dll is not
+    /// loaded (the shim loads it on the first QueryInterface — any prior
+    /// NVAPI call primes it) or the signature scan finds no transport.
+    pub fn thermal_policy_compact_status(
+        &self,
+    ) -> crate::Result<Option<Vec<crate::thermal::CompactThermalPolicy>>> {
+        trace!("gpu.thermal_policy_compact_status()");
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> isize;
+            fn VirtualQuery(addr: *const u8, info: *mut u8, len: usize) -> usize;
+        }
+        let mut modname: Vec<u16> = "nvapi64_impl.dll\0".encode_utf16().collect();
+        let base = unsafe { GetModuleHandleW(modname.as_mut_ptr()) } as usize;
+        if base == 0 {
+            return Ok(None);
+        }
+        // Resolve the transport by signature vote (B9 8F 01 00 07 E8 + rel32).
+        const SIG: [u8; 6] = [0xB9, 0x8F, 0x01, 0x00, 0x07, 0xE8];
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        let mut addr = base;
+        let mut mbi = [0u8; 48];
+        loop {
+            let n = unsafe { VirtualQuery(addr as *const u8, mbi.as_mut_ptr(), mbi.len()) };
+            if n == 0 {
+                break;
+            }
+            let rb = usize::from_le_bytes(mbi[0..8].try_into().unwrap());
+            let rs = usize::from_le_bytes(mbi[24..32].try_into().unwrap());
+            let state = u32::from_le_bytes(mbi[32..36].try_into().unwrap());
+            let prot = u32::from_le_bytes(mbi[36..40].try_into().unwrap());
+            if rb > base + 0x2000_0000 {
+                break;
+            }
+            if state == 0x1000 && (prot & 0xEE) != 0 && (prot & 0x100) == 0 {
+                let s = rb.max(base);
+                let e = (rb + rs).min(base + 0x2000_0000);
+                let sl = unsafe { std::slice::from_raw_parts(s as *const u8, e.saturating_sub(s)) };
+                for w in sl.windows(10) {
+                    if w[..6] == SIG {
+                        let rel = i32::from_le_bytes(w[6..10].try_into().unwrap());
+                        let site = s + (w.as_ptr() as usize - sl.as_ptr() as usize);
+                        let tgt = site.wrapping_add(10).wrapping_add(rel as usize);
+                        if let Some(t) = targets.iter_mut().find(|(a, _)| *a == tgt) {
+                            t.1 += 1;
+                        } else {
+                            targets.push((tgt, 1));
+                        }
+                    }
+                }
+            }
+            addr = rb.wrapping_add(rs);
+            if addr <= rb {
+                break;
+            }
+        }
+        targets.sort_by(|a, b| b.1.cmp(&a.1));
+        let Some(&(transport_addr, votes)) = targets.first() else {
+            return Ok(None);
+        };
+        if votes < 3 {
+            return Ok(None);
+        }
+        // Armed mask from PRIVATE INFO v4|15732 (accepted on 621.01/621.24);
+        // fall back to slot 0 when unavailable.
+        let mut mask = 1u32;
+        if let Some(f) = (|| {
+            sys::nvapi_QueryInterface(0x2F69F8E5)
+                .ok()
+                .filter(|p| !p.is_null())
+                .map(|p| unsafe {
+                    core::mem::transmute::<
+                        *mut core::ffi::c_void,
+                        unsafe extern "C" fn(
+                            sys::handles::NvPhysicalGpuHandle,
+                            *mut core::ffi::c_void,
+                            usize,
+                        ) -> sys::NvAPI_Status,
+                    >(p)
+                })
+        })() {
+            let mut info = vec![0u8; 15732];
+            info[0..4].copy_from_slice(&((4u32 << 16) | 15732).to_le_bytes());
+            if unsafe { f(self.0, info.as_mut_ptr().cast(), 15732) } == 0 {
+                mask = u32::from_le_bytes(info[4..8].try_into().unwrap());
+                if mask == 0 {
+                    mask = 1;
+                }
+            }
+        }
+        let idv = self.0.as_ptr() as usize as u32;
+        let mut req = vec![0u8; 1496];
+        req[48..52].copy_from_slice(&idv.to_le_bytes());
+        req[52..56].copy_from_slice(&0x2080_852Cu32.to_le_bytes());
+        req[64..68].copy_from_slice(&mask.to_le_bytes());
+        req[88] = 0xFF;
+        let mut k = 2usize;
+        while 88 * k < 1496 {
+            req[88 * k - 4] = 0xFF;
+            req[88 * k] = 0xFF;
+            k += 1;
+        }
+        type Transport = unsafe extern "system" fn(u32, *mut u8, u32, usize, u8, u8, usize) -> u32;
+        let transport: Transport = unsafe { core::mem::transmute(transport_addr) };
+        let st = unsafe { transport(0x0700_018F, req.as_mut_ptr(), 1496, 0, 0, 0, 0) };
+        let lane_error = || {
+            crate::Error::Nvapi(crate::NvapiError {
+                nvid: sys::Api::NvAPI_GPU_ClientThermalPoliciesGetStatus,
+                status: crate::Status::Error,
+                raw_status: None,
+            })
+        };
+        if st != 0 {
+            return Err(lane_error());
+        }
+        let guard = u32::from_le_bytes(req[44..48].try_into().unwrap());
+        let echo_cmd = u32::from_le_bytes(req[52..56].try_into().unwrap());
+        let echo_mask = u32::from_le_bytes(req[64..68].try_into().unwrap());
+        if guard != 1 || echo_cmd != 0x2080_852C || echo_mask != mask {
+            return Err(lane_error());
+        }
+        let mut out = Vec::new();
+        for slot in 0..16usize {
+            if mask & (1 << slot) == 0 {
+                continue;
+            }
+            let e = 56 + 32 + 88 * slot; // payload @+56, C entry @32+88i
+            if e + 88 > req.len() {
+                break;
+            }
+            if req[e] != 4 {
+                continue; // identity byte: 4 = GPU thermal policy
+            }
+            let temp = u32::from_le_bytes(req[e + 4..e + 8].try_into().unwrap());
+            let mut pff = Vec::new();
+            // entry +16 = policy-level pff presence; the three 12 B points
+            // {enabled, freq, temp} start at +20 (live-verified on 2070/621.01:
+            // (1, 1652 MHz, 81C) x (86C, 88C) triple).
+            for p in 0..3usize {
+                let po = e + 20 + 12 * p;
+                let enabled = u32::from_le_bytes(req[po..po + 4].try_into().unwrap());
+                if enabled == 0 {
+                    continue;
+                }
+                let freq = u32::from_le_bytes(req[po + 4..po + 8].try_into().unwrap());
+                let ptemp = u32::from_le_bytes(req[po + 8..po + 12].try_into().unwrap());
+                pff.push((
+                    crate::types::CelsiusShifted(ptemp as i32),
+                    crate::types::Kilohertz(freq),
+                ));
+            }
+            let q = |i: usize| {
+                crate::types::CelsiusShifted(u32::from_le_bytes(
+                    req[e + 60 + 4 * i..e + 64 + 4 * i].try_into().unwrap(),
+                ) as i32)
+            };
+            out.push(crate::thermal::CompactThermalPolicy {
+                slot,
+                temp_c: crate::types::CelsiusShifted(temp as i32),
+                remove_tdp_limit: req[e + 84] == 1,
+                pff_points: pff,
+                quad: [q(2), q(3), q(4), q(5)],
+            });
+        }
+        Ok(Some(out))
+    }
+
     pub fn set_thermal_limit<I: IntoIterator<Item = crate::thermal::ThermalLimit>>(
         &self,
         value: I,

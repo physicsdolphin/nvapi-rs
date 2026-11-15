@@ -1880,6 +1880,17 @@ impl Gpu {
         self.gpu.thermal_target_remove_tdp_flags()
     }
 
+    /// Compact per-slot thermal-policy STATUS via the RM lane (mVolt+
+    /// 0.50.13 readout — the read face that stays alive on RTX 50 desktop
+    /// where the documented family arms nothing). `None` when
+    /// nvapi64_impl.dll is not loaded or the transport signature is absent.
+    /// See [`PhysicalGpu::thermal_policy_compact_status`](crate::PhysicalGpu::thermal_policy_compact_status).
+    pub fn thermal_policy_compact_status(
+        &self,
+    ) -> crate::Result<Option<Vec<crate::thermal::CompactThermalPolicy>>> {
+        self.gpu.thermal_policy_compact_status()
+    }
+
     pub fn set_cooler_levels<I: IntoIterator<Item = (FanCoolerId, CoolerSettings)>>(
         &self,
         levels: I,

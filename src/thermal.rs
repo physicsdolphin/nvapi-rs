@@ -140,6 +140,31 @@ pub struct ThermalLimit {
     pub pff: Option<PffStatus>,
 }
 
+/// One slot of the compact thermal-policy STATUS served by the RM lane
+/// (internal method 0x0700018F + RM control 0x2080852C — the mVolt+ 0.50.13
+/// "Thermal limits" readout, live-verified on RTX 2070/621.01 and RTX 5060
+/// Ti/621.24). This is the read face that stays alive where the documented
+/// ClientThermalPoliciesGetStatus family arms nothing (RTX 50 desktop).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Hash, PartialOrd, Ord, PartialEq, Eq, Default)]
+pub struct CompactThermalPolicy {
+    /// Target-policy slot index (RTX 50: 0=GPU / 1=Hotspot / 4=Memory).
+    pub slot: usize,
+    /// Armed temp wall (Q8 celsius).
+    pub temp_c: CelsiusShifted,
+    /// `bRemoveTdpLimit` (entry byte +84).
+    pub remove_tdp_limit: bool,
+    /// PFF throttle-curve points (temp Q8, freq kHz) at entry +16..+52 —
+    /// three `{enabled, freq, temp}` records; empty when the policy carries
+    /// no curve (RTX 50 desktop arms none).
+    pub pff_points: Vec<(CelsiusShifted, Kilohertz)>,
+    /// Live throttle-curve quad mirror (entry +60..+84 tail, Q8) — the wall
+    /// the driver actually enforces (`[c+1,c,c-1,c-3]` after a
+    /// set_thermal_policy_curve write; may carry stale writes, e.g. the
+    /// f(20 C) residue observed after mVolt experiments).
+    pub quad: [CelsiusShifted; 4],
+}
+
 impl ThermalLimit {
     pub fn to_raw(&self) -> thermal::undocumented::NV_GPU_CLIENT_THERMAL_POLICY_STATUS_V3 {
         let mut entry = thermal::undocumented::NV_GPU_CLIENT_THERMAL_POLICY_STATUS_V3 {
