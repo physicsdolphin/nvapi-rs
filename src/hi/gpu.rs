@@ -1855,6 +1855,15 @@ impl Gpu {
         self.gpu.set_thermal_policy_curve(slot, celsius)
     }
 
+    /// Documented thermal-policy STATUS readout
+    /// (ClientThermalPoliciesGetStatus V3→V2 fallback): per-armed policy —
+    /// temp wall, `bRemoveTdpLimit`, PFF throttle curve. This is the read-back
+    /// counterpart of [`Self::set_sensor_limits`]; empty on drivers that don't
+    /// arm any policy (RTX 50 desktop reports none).
+    pub fn thermal_policy_status(&self) -> crate::Result<Vec<ThermalLimit>> {
+        self.gpu.thermal_limit()
+    }
+
     pub fn set_cooler_levels<I: IntoIterator<Item = (FanCoolerId, CoolerSettings)>>(
         &self,
         levels: I,
