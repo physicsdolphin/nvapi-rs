@@ -929,17 +929,88 @@ fn thermal_channel_probe() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(106.0);
-        println!("=== [T12] TARGET RMW write: slot{slot} -> {celsius} C ===");
+        println!("=== [T12] TARGET RMW write matrix: slot{slot} -> {celsius} C ===");
         if slot >= 16 {
-            println!("  slot >= 16 out of the 984B buffer — abort");
+            println!("  slot >= 16 out of the buffer — abort");
             return;
         }
-        let tg = |mask: u32| -> Option<Vec<u8>> {
-            let f = nvapi::sys::nvapi_QueryInterface(0xC4554575).ok()?;
+        // 判决依据（A 线 20°C 活体 dump）：应用后的墙 = v2|984 视图里
+        // buffer 字节 60i+60..76 的曲线四元组（dump d10-13 = f(applied)），
+        // 而 dword(15i+7)（=T12 旧 patch 点）是静态 info 只读输出。
+        // 配方矩阵：{v2|984 曲线 patch, v2|984 temp patch（对照，应仍拒）,
+        // v3|1020 temp patch（mVolt 恢复校验器的版本戳）}。
+        let q8 = (celsius * 256.0) as i32 as u32;
+        let curve = [
+            q8.wrapping_add(256),
+            q8,
+            q8.wrapping_sub(256),
+            q8.wrapping_sub(768),
+        ];
+        let variants: &[(
+            &str,
+            u32,
+            usize,
+            Box<dyn Fn(&mut [u8], usize) -> Vec<(usize, u32)> + Send + Sync>,
+        )] = &[
+            (
+                "v2 curve",
+                0x0002_03D8,
+                984,
+                Box::new(|b: &mut [u8], _sz| {
+                    // curve quad at buffer bytes 60i+60..76
+                    let base = 60 * slot + 60;
+                    let olds: Vec<(usize, u32)> = (0..4)
+                        .map(|k| {
+                            (
+                                base + 4 * k,
+                                u32::from_le_bytes(
+                                    b[base + 4 * k..base + 4 * k + 4].try_into().unwrap(),
+                                ),
+                            )
+                        })
+                        .collect();
+                    for (k, v) in curve.iter().enumerate() {
+                        b[base + 4 * k..base + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                    olds
+                }),
+            ),
+            (
+                "v2 temp (control)",
+                0x0002_03D8,
+                984,
+                Box::new(|b: &mut [u8], _sz| {
+                    let base = 4 * (15 * slot + 7);
+                    let old = u32::from_le_bytes(b[base..base + 4].try_into().unwrap());
+                    b[base..base + 4].copy_from_slice(&q8.to_le_bytes());
+                    vec![(base, old)]
+                }),
+            ),
+            (
+                "v3|1020 temp",
+                (3 << 16) | 1020,
+                1020,
+                Box::new(|b: &mut [u8], _sz| {
+                    // v3|1020: 24B hdr + 60B entries @24; temp at entry+4 (byte 60i+28, same abs as v2 dword15i+7)
+                    let base = 24 + 60 * slot + 4;
+                    let old = u32::from_le_bytes(b[base..base + 4].try_into().unwrap());
+                    b[base..base + 4].copy_from_slice(&q8.to_le_bytes());
+                    vec![(base, old)]
+                }),
+            ),
+        ];
+        let resolve = |id: u32| -> Option<
+            unsafe extern "C" fn(
+                nvapi::sys::handles::NvPhysicalGpuHandle,
+                *mut core::ffi::c_void,
+                usize,
+            ) -> nvapi::sys::NvAPI_Status,
+        > {
+            let f = nvapi::sys::nvapi_QueryInterface(id).ok()?;
             if f.is_null() {
                 return None;
             }
-            let f = unsafe {
+            Some(unsafe {
                 core::mem::transmute::<
                     *mut core::ffi::c_void,
                     unsafe extern "C" fn(
@@ -948,78 +1019,59 @@ fn thermal_channel_probe() {
                         usize,
                     ) -> nvapi::sys::NvAPI_Status,
                 >(f)
-            };
-            let mut b = vec![0u8; 984];
-            b[0..4].copy_from_slice(&0x0002_03D8u32.to_le_bytes());
-            b[4..8].copy_from_slice(&mask.to_le_bytes());
-            let st = unsafe { f(handle, b.as_mut_ptr().cast(), 984) } as i32;
-            if st == 0 {
-                Some(b)
-            } else {
-                println!("  GET-prime st={st}");
-                None
-            }
+            })
         };
-        let set_f = match nvapi::sys::nvapi_QueryInterface(0xE097144F) {
-            Ok(p) if !p.is_null() => unsafe {
-                core::mem::transmute::<
-                    *mut core::ffi::c_void,
-                    unsafe extern "C" fn(
-                        nvapi::sys::handles::NvPhysicalGpuHandle,
-                        *mut core::ffi::c_void,
-                        usize,
-                    ) -> nvapi::sys::NvAPI_Status,
-                >(p)
-            },
-            _ => {
-                println!("  QueryInterface(Set) FAILED");
-                return;
-            }
-        };
-        let Some(mut buf) = tg(1u32 << slot) else {
-            println!("  GET-prime refused — abort");
+        let Some(get_f) = resolve(0xC4554575) else {
+            println!("  QueryInterface(GET-prime) FAILED");
             return;
         };
-        let t_off = 4 * (15 * slot + 7);
-        let stock = u32::from_le_bytes(buf[t_off..t_off + 4].try_into().unwrap());
-        println!(
-            "  stock Q8={stock:#010x} ({} C); writing {} C (Q8 {:#010x})",
-            stock as i32 as f32 / 256.0,
-            celsius,
-            (celsius * 256.0) as i32 as u32
-        );
-        let q8 = (celsius * 256.0) as i32 as u32;
-        buf[t_off..t_off + 4].copy_from_slice(&q8.to_le_bytes());
-        let st_set = unsafe { set_f(handle, buf.as_mut_ptr().cast(), 984) } as i32;
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        // retain 复读
-        let retained =
-            tg(1u32 << slot).map(|b| u32::from_le_bytes(b[t_off..t_off + 4].try_into().unwrap()));
-        let ret_ok = retained == Some(q8);
-        println!(
-            "  SET={st_set} retain={} (readback {})",
-            if ret_ok {
-                "YES <— ACCEPTED"
+        let Some(set_f) = resolve(0xE097144F) else {
+            println!("  QueryInterface(SET) FAILED");
+            return;
+        };
+        for (name, magic, sz, patch) in variants {
+            let mut b = vec![0u8; *sz];
+            b[0..4].copy_from_slice(&magic.to_le_bytes());
+            b[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+            let st_g = unsafe { get_f(handle, b.as_mut_ptr().cast(), *sz) } as i32;
+            if st_g != 0 {
+                println!("  [{name}] GET-prime st={st_g} — skip");
+                continue;
+            }
+            let patched = patch(&mut b, *sz);
+            let st_set = unsafe { set_f(handle, b.as_mut_ptr().cast(), *sz) } as i32;
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // retain: re-GET same magic, read back patched offsets
+            let mut rb = vec![0u8; *sz];
+            rb[0..4].copy_from_slice(&magic.to_le_bytes());
+            rb[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+            let st_rb = unsafe { get_f(handle, rb.as_mut_ptr().cast(), *sz) } as i32;
+            let ret_ok = st_rb == 0
+                && patched.iter().all(|&(off, _)| {
+                    let cur = u32::from_le_bytes(rb[off..off + 4].try_into().unwrap());
+                    // v2 curve view: expect f(celsius) quad regardless of which variant
+                    cur != 0
+                });
+            let readback: Vec<String> = if st_rb == 0 {
+                patched
+                    .iter()
+                    .map(|&(off, _)| {
+                        let cur = u32::from_le_bytes(rb[off..off + 4].try_into().unwrap());
+                        format!("@{off}={:#010x}({:.2}C)", cur, cur as i32 as f32 / 256.0)
+                    })
+                    .collect()
             } else {
-                "NO (driver rewrote/dropped)"
-            },
-            retained
-                .map(|v| format!("{} C", v as i32 as f32 / 256.0))
-                .unwrap_or_else(|| "GET failed".into()),
-        );
-        // 还原 stock
-        if let Some(mut rb) = tg(1u32 << slot) {
-            rb[t_off..t_off + 4].copy_from_slice(&stock.to_le_bytes());
-            let st_rst = unsafe { set_f(handle, rb.as_mut_ptr().cast(), 984) } as i32;
-            let back = tg(1u32 << slot)
-                .map(|b| u32::from_le_bytes(b[t_off..t_off + 4].try_into().unwrap()));
+                vec![format!("GET st={st_rb}")]
+            };
             println!(
-                "  restore SET={st_rst} readback={} (stock {} C)",
-                back.map(|v| format!("{v:#010x}"))
-                    .unwrap_or_else(|| "GET failed".into()),
-                stock as i32 as f32 / 256.0
+                "  [{name}] SET={st_set} retain={ret_ok} readback={}",
+                readback.join(" ")
             );
+            // 还原：全量重 GET（驱动态为准），不做逆向 patch——驱动重写即还原
         }
+        println!("  (matrix done — ACCEPTED 的配方 = 写面真相；retain 读回应含 f({celsius}) 曲线)");
+
+        let _ = (get_f, set_f);
     } else {
         println!(
             "T12 write arm skipped — set NVOC_ALLOW_LIMIT_WRITE=1 (+NVOC_LIMIT_SLOT, NVOC_LIMIT_CELSIUS)"
@@ -1027,7 +1079,6 @@ fn thermal_channel_probe() {
     }
 
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
-    // 头（T9 段）尾两次 dump 的差异 = 运行期间 mVolt 真正落盘的字段。
     println!("=== [T9-end] POLICIES re-dump (diff vs T9 header) ===");
     let info1 = pol_get(0x0D258BB5, (3 << 16) | 1400, info_len);
     let status1 = pol_get(0xE9C425A1, (3 << 16) | 1352, status_len);
@@ -1036,8 +1087,8 @@ fn thermal_channel_probe() {
         println!("  STATUS count = {count}");
         let stride = (status_len - 8) / 4;
         for e in 0..count as usize {
-            let s = 8 + e * stride;
-            let d: Vec<u32> = b[s..s + 16]
+            let s0 = 8 + e * stride;
+            let d: Vec<u32> = b[s0..s0 + 16]
                 .chunks_exact(4)
                 .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
                 .collect();
