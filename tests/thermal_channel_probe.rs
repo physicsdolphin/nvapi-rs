@@ -1663,13 +1663,12 @@ fn thermal_channel_probe() {
                     continue; // 只试高票候选（impl 标准 escape 对）
                 }
                 let transport: Transport = unsafe { core::mem::transmute(t) };
-                for &mask in &[1u32, 0x5u32, 0x13u32] {
+                for &mask in &[0x13u32, 0x5u32, 0x1u32] {
                     let mut req = build18(mask);
                     let st = unsafe { transport(0x0700_018F, req.as_mut_ptr(), 1496, 0, 0, 0, 0) };
                     println!("  call transport {t:#x} mask={mask:#x}: st={st:#x}");
                     if st == 0 {
                         report18(&format!("resp {t:#x}/{mask:#x}"), &req);
-                        break; // guard 通过即停
                     }
                 }
             }
