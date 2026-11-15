@@ -1138,11 +1138,7 @@ fn thermal_channel_probe() {
                         b[0..4].copy_from_slice(&0x0002_03D8u32.to_le_bytes());
                         b[4..8].copy_from_slice(&(1u32 << i).to_le_bytes());
                         let st = unsafe { get_f(handle, b.as_mut_ptr().cast(), 984) } as i32;
-                        if st == 0 {
-                            Some(b)
-                        } else {
-                            None
-                        }
+                        if st == 0 { Some(b) } else { None }
                     })
                     .collect()
             };
@@ -1211,6 +1207,553 @@ fn thermal_channel_probe() {
         println!(
             "T13 flag-hunt arm skipped — set NVOC_ALLOW_TDP_FLAG_WRITE=1 (mobile lane required)"
         );
+    }
+
+    // ---- ⑧T14: mVolt 50 系新一代戳（validator sub_1401DA290 反编译几何）----
+    // A=PRIVATE INFO v4|15732（0x2F69F8E5，mask@dword1，entry @924·i+948：
+    //   +0=identity dword(GPU=4)/+4 BYTE=UI key/+8/+12/+16=min/cur/max Q8）。
+    // B=TARGET v3|1020（0xC4554575/0xE097144F，entry @60·i+24：+0=identity/
+    //   +4=temp Q8/+36..52=quad(非递增)/+52 bit0=d14 钳制旗；尾部 984..1004
+    //   {qword,qword,dword} 必须逐字等于 C 头 +12/+20/+28）。
+    // C=紧凑 STATUS v3|1440（0xE9C425A1，32B hdr+16×88B entry @32：+0 identity
+    //   byte/+4=temp/+12=B entry+8(=v2 d3) 镜像/+16..60=PFF 区候选/+60..84=24B
+    //   控制块镜像(=B d8..d14)/+84 BYTE=remove_tdp(1=TRUE)）。
+    // 判决问题：50 系驱动收不收这两个新戳（我们此前只试过 v3|15704/v3|1352）；
+    // 新戳里有没有 50 系的活态（documented v3|1352 count=0 的替代读出面）。
+    println!("=== [T14] next-gen stamps: INFO v4|15732 + STATUS v3|1440 + TARGET v3|1020 ===");
+    let resolve14 = |id: u32| -> Option<
+        unsafe extern "C" fn(
+            nvapi::sys::handles::NvPhysicalGpuHandle,
+            *mut core::ffi::c_void,
+            usize,
+        ) -> nvapi::sys::NvAPI_Status,
+    > {
+        let f = nvapi::sys::nvapi_QueryInterface(id).ok()?;
+        if f.is_null() {
+            return None;
+        }
+        Some(unsafe {
+            core::mem::transmute::<
+                *mut core::ffi::c_void,
+                unsafe extern "C" fn(
+                    nvapi::sys::handles::NvPhysicalGpuHandle,
+                    *mut core::ffi::c_void,
+                    usize,
+                ) -> nvapi::sys::NvAPI_Status,
+            >(f)
+        })
+    };
+    let q8c = |v: u32| (v as i32) as f32 / 256.0;
+    // A: PRIVATE INFO v4|15732
+    let mut t14_a: Option<Vec<u8>> = None;
+    if let Some(f) = resolve14(0x2F69F8E5) {
+        let mut b = vec![0u8; 15732];
+        b[0..4].copy_from_slice(&((4u32 << 16) | 15732).to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), 15732) } as i32;
+        println!("  INFO v4|15732 GET st={st}");
+        if st == 0 {
+            let mask = u32::from_le_bytes(b[4..8].try_into().unwrap());
+            println!("  mask = {mask:#010x}");
+            for i in 0..16usize {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                let e = 924 * i + 948;
+                if e + 20 > 15732 {
+                    break;
+                }
+                let id = u32::from_le_bytes(b[e..e + 4].try_into().unwrap());
+                let key = b[e + 4];
+                let mn = u32::from_le_bytes(b[e + 8..e + 12].try_into().unwrap());
+                let cu = u32::from_le_bytes(b[e + 12..e + 16].try_into().unwrap());
+                let mx = u32::from_le_bytes(b[e + 16..e + 20].try_into().unwrap());
+                println!(
+                    "  slot{i}: id={id} key={key} min={:.2} cur={:.2} max={:.2} (Q8 C)",
+                    q8c(mn),
+                    q8c(cu),
+                    q8c(mx)
+                );
+            }
+            t14_a = Some(b);
+        }
+    }
+    // C: 紧凑 STATUS v3|1440
+    let mut t14_c: Option<Vec<u8>> = None;
+    if let Some(f) = resolve14(0xE9C425A1) {
+        let mut b = vec![0u8; 1440];
+        b[0..4].copy_from_slice(&((3u32 << 16) | 1440).to_le_bytes());
+        let st = unsafe { f(handle, b.as_mut_ptr().cast(), 1440) } as i32;
+        println!("  STATUS v3|1440 GET st={st}");
+        if st == 0 {
+            let mask = u32::from_le_bytes(b[8..12].try_into().unwrap());
+            let hdr: Vec<String> = b[0..32]
+                .chunks_exact(4)
+                .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                .collect();
+            println!("  mask = {mask:#010x} hdr = [{}]", hdr.join(" "));
+            for i in 0..16usize {
+                if mask & (1 << i) == 0 {
+                    continue;
+                }
+                let e = 88 * i + 32;
+                if e + 88 > 1440 {
+                    break;
+                }
+                let id = b[e];
+                let temp = u32::from_le_bytes(b[e + 4..e + 8].try_into().unwrap());
+                let d12 = u32::from_le_bytes(b[e + 12..e + 16].try_into().unwrap());
+                let flag = b[e + 84];
+                let mid: Vec<String> = b[e + 16..e + 60]
+                    .chunks_exact(4)
+                    .enumerate()
+                    .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                    .map(|(k, w)| {
+                        format!(
+                            "d{}={:#010x}",
+                            4 + k,
+                            u32::from_le_bytes(w.try_into().unwrap())
+                        )
+                    })
+                    .collect();
+                let blk: Vec<String> = b[e + 60..e + 84]
+                    .chunks_exact(4)
+                    .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                    .collect();
+                println!(
+                    "  slot{i}: id={id} temp={:.2}C d12={d12:#x} remove_tdp={} mid=[{}] ctrl=[{}]",
+                    q8c(temp),
+                    flag == 1,
+                    mid.join(" "),
+                    blk.join(" ")
+                );
+            }
+            t14_c = Some(b);
+        }
+    }
+    // B: TARGET v3|1020（单 bit 掩码逐槽 + 尾部关联字段）
+    let mut t14_b: Vec<Option<Vec<u8>>> = Vec::new();
+    if let Some(f) = resolve14(0xC4554575) {
+        for i in 0..16usize {
+            let mut b = vec![0u8; 1020];
+            b[0..4].copy_from_slice(&((3u32 << 16) | 1020).to_le_bytes());
+            b[4..8].copy_from_slice(&(1u32 << i).to_le_bytes());
+            let st = unsafe { f(handle, b.as_mut_ptr().cast(), 1020) } as i32;
+            if st != 0 {
+                t14_b.push(None);
+                continue;
+            }
+            let e = 60 * i + 24;
+            let id = u32::from_le_bytes(b[e..e + 4].try_into().unwrap());
+            let temp = u32::from_le_bytes(b[e + 4..e + 8].try_into().unwrap());
+            let quad: Vec<String> = b[e + 36..e + 52]
+                .chunks_exact(4)
+                .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                .collect();
+            let d14 = u32::from_le_bytes(b[e + 52..e + 56].try_into().unwrap());
+            println!(
+                "  TARGET v3|1020 slot{i}: id={id} temp={:.2}C quad=[{}] d14={d14:#x}",
+                q8c(temp),
+                quad.join(" ")
+            );
+            if i == 0 {
+                let t0 = u64::from_le_bytes(b[984..992].try_into().unwrap());
+                let t1 = u64::from_le_bytes(b[992..1000].try_into().unwrap());
+                let t2 = u32::from_le_bytes(b[1000..1004].try_into().unwrap());
+                println!("    tail@984: {t0:#x} {t1:#x} {t2:#x} (应== C hdr +12/+20/+28)");
+            }
+            t14_b.push(Some(b));
+        }
+    }
+    // T14w: 新戳写矩阵（门控）——①documented SET 0x34C0B13D 在 50 系从未试过
+    // （v3|1352 entry0 temp -1C 保守向 → SET → retain → 还原）；②TARGET v3|1020
+    // quad -1C patch → SET → retain（mVolt 原生戳收不收写）。
+    if std::env::var("NVOC_ALLOW_LIMIT_WRITE").is_ok() {
+        println!("=== [T14w] next-gen stamp write matrix ===");
+        // ① documented SET（v3|1352 temp）
+        if let (Some(g), Some(s)) = (resolve14(0xE9C425A1), resolve14(0x34C0B13D)) {
+            let mut b = vec![0u8; 1352];
+            b[0..4].copy_from_slice(&((3u32 << 16) | 1352).to_le_bytes());
+            if unsafe { g(handle, b.as_mut_ptr().cast(), 1352) } as i32 == 0 {
+                let count = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                if count > 0 {
+                    let off = 8 + 12; // entry0 +4 = temp Q8
+                    let old = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+                    let newv = (old as i32).saturating_sub(256) as u32; // -1C 保守向
+                    b[off..off + 4].copy_from_slice(&newv.to_le_bytes());
+                    let st_set = unsafe { s(handle, b.as_mut_ptr().cast(), 1352) } as i32;
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let mut rb = vec![0u8; 1352];
+                    rb[0..4].copy_from_slice(&((3u32 << 16) | 1352).to_le_bytes());
+                    let st_rb = unsafe { g(handle, rb.as_mut_ptr().cast(), 1352) } as i32;
+                    let got = if st_rb == 0 {
+                        u32::from_le_bytes(rb[off..off + 4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    println!(
+                        "  [doc SET v3|1352 temp] count={count} old={old:#x} new={newv:#x} SET={st_set} retained={}",
+                        st_rb == 0 && got == newv
+                    );
+                    // 还原：原样 SET 回 GET 到的缓冲
+                    let mut b0 = vec![0u8; 1352];
+                    b0[0..4].copy_from_slice(&((3u32 << 16) | 1352).to_le_bytes());
+                    if unsafe { g(handle, b0.as_mut_ptr().cast(), 1352) } as i32 == 0 {
+                        let st_rst = unsafe { s(handle, b0.as_mut_ptr().cast(), 1352) } as i32;
+                        println!("  restore doc STATUS: SET={st_rst}");
+                    }
+                } else {
+                    println!("  [doc SET v3|1352 temp] count=0 — nothing armed to patch");
+                }
+            } else {
+                println!("  [doc SET v3|1352 temp] GET failed — skip");
+            }
+        }
+        // ② TARGET v3|1020 quad patch（mVolt 原生戳）
+        if let (Some(g), Some(s)) = (resolve14(0xC4554575), resolve14(0xE097144F)) {
+            let slot: usize = std::env::var("NVOC_LIMIT_SLOT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let mut b = vec![0u8; 1020];
+            b[0..4].copy_from_slice(&((3u32 << 16) | 1020).to_le_bytes());
+            b[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+            if unsafe { g(handle, b.as_mut_ptr().cast(), 1020) } as i32 == 0 {
+                let base = 60 * slot + 60; // quad @ entry+36 = abs 60i+60（同 v2）
+                let olds: Vec<u32> = (0..4)
+                    .map(|k| {
+                        u32::from_le_bytes(b[base + 4 * k..base + 4 * k + 4].try_into().unwrap())
+                    })
+                    .collect();
+                let news: Vec<u32> = olds
+                    .iter()
+                    .map(|&v| (v as i32).saturating_sub(256) as u32)
+                    .collect();
+                for (k, v) in news.iter().enumerate() {
+                    b[base + 4 * k..base + 4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                let st_set = unsafe { s(handle, b.as_mut_ptr().cast(), 1020) } as i32;
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let mut rb = vec![0u8; 1020];
+                rb[0..4].copy_from_slice(&((3u32 << 16) | 1020).to_le_bytes());
+                rb[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+                let st_rb = unsafe { g(handle, rb.as_mut_ptr().cast(), 1020) } as i32;
+                let ret = st_rb == 0
+                    && news.iter().enumerate().all(|(k, v)| {
+                        u32::from_le_bytes(rb[base + 4 * k..base + 4 * k + 4].try_into().unwrap())
+                            == *v
+                    });
+                println!(
+                    "  [TARGET v3|1020 quad slot{slot}] olds={:?} news={:?} SET={st_set} retained={ret}",
+                    olds.iter().map(|v| format!("{v:#x}")).collect::<Vec<_>>(),
+                    news.iter().map(|v| format!("{v:#x}")).collect::<Vec<_>>(),
+                );
+                // 还原：重 GET 原态 → 原样 SET
+                let mut b0 = vec![0u8; 1020];
+                b0[0..4].copy_from_slice(&((3u32 << 16) | 1020).to_le_bytes());
+                b0[4..8].copy_from_slice(&(1u32 << slot).to_le_bytes());
+                if unsafe { g(handle, b0.as_mut_ptr().cast(), 1020) } as i32 == 0 {
+                    let st_rst = unsafe { s(handle, b0.as_mut_ptr().cast(), 1020) } as i32;
+                    println!("  restore TARGET v3|1020: SET={st_rst}");
+                }
+            } else {
+                println!("  [TARGET v3|1020 quad] GET-prime failed — stamp refused on this driver");
+            }
+        }
+    } else {
+        println!("T14w write matrix skipped — set NVOC_ALLOW_LIMIT_WRITE=1");
+    }
+
+    // T14-end 复读（头尾夹住整个运行期的 mVolt/CLI 操作）
+    println!("=== [T14-end] next-gen stamps re-dump (diff vs T14 header) ===");
+    {
+        let diff14 = |name: &str, a0: &[u8], b1: &[u8]| {
+            let diffs: Vec<usize> = a0
+                .chunks_exact(4)
+                .zip(b1.chunks_exact(4))
+                .enumerate()
+                .filter(|&(_, (x, y))| x != y)
+                .map(|(k, _)| k)
+                .collect();
+            if diffs.is_empty() {
+                println!("  {name}: unchanged");
+            } else {
+                println!(
+                    "  {name}: {} dwords changed (first at dword{})",
+                    diffs.len(),
+                    diffs[0]
+                );
+                for &k in diffs.iter().take(8) {
+                    let off = k * 4;
+                    println!(
+                        "    dword{k} (abs {}): {:#010x} -> {:#010x}",
+                        4 + off,
+                        u32::from_le_bytes(a0[off..off + 4].try_into().unwrap()),
+                        u32::from_le_bytes(b1[off..off + 4].try_into().unwrap())
+                    );
+                }
+            }
+        };
+        if let (Some(f), Some(a0)) = (resolve14(0x2F69F8E5), t14_a.as_ref()) {
+            let mut b = vec![0u8; 15732];
+            b[0..4].copy_from_slice(&((4u32 << 16) | 15732).to_le_bytes());
+            if unsafe { f(handle, b.as_mut_ptr().cast(), 15732) } as i32 == 0 {
+                diff14("INFO v4|15732", a0, &b);
+            } else {
+                println!("  INFO v4|15732 re-GET failed");
+            }
+        }
+        if let (Some(f), Some(c0)) = (resolve14(0xE9C425A1), t14_c.as_ref()) {
+            let mut b = vec![0u8; 1440];
+            b[0..4].copy_from_slice(&((3u32 << 16) | 1440).to_le_bytes());
+            if unsafe { f(handle, b.as_mut_ptr().cast(), 1440) } as i32 == 0 {
+                diff14("STATUS v3|1440", c0, &b);
+            } else {
+                println!("  STATUS v3|1440 re-GET failed");
+            }
+        }
+        if let Some(f) = resolve14(0xC4554575) {
+            for (i, b0) in t14_b.iter().enumerate() {
+                let Some(b0) = b0 else { continue };
+                let mut b = vec![0u8; 1020];
+                b[0..4].copy_from_slice(&((3u32 << 16) | 1020).to_le_bytes());
+                b[4..8].copy_from_slice(&(1u32 << i).to_le_bytes());
+                if unsafe { f(handle, b.as_mut_ptr().cast(), 1020) } as i32 == 0 {
+                    diff14(&format!("TARGET v3|1020 slot{i}"), b0, &b);
+                }
+            }
+        }
+    }
+
+    // ---- ⑨T15: C 紧凑 STATUS 的真源——RM control 0x2080B26C over NVAPI 0x0700002F ----
+    // mVolt sub_140277BB0 反编译（"Thermal policy mode readback"）：请求 1496B
+    // [+0=id][+52=0x2080B26C][+64=mask][0xFF 哨兵 @88 与 88k+84/88k+88(k=1..15)]；
+    // 响应 guard +44=1/+48=id/+52=cmd/+64=mask；payload @+56 = C(1440B)——
+    // C+8=mask 的位置严丝合缝（56+8=64）。0x0700002F = 0x07 系 NVAPI escape 族
+    // （同 0x07000191 VoltRails 车道）。备选 transport：0x07000191。
+    println!("=== [T15] C-source: RM control 0x2080B26C via NVAPI escape ===");
+    {
+        let idv = handle.as_ptr() as usize as u32;
+        let build15 = |mask: u32| -> Vec<u8> {
+            let mut b = vec![0u8; 1496];
+            b[0..4].copy_from_slice(&idv.to_le_bytes());
+            b[52..56].copy_from_slice(&0x2080_B26Cu32.to_le_bytes());
+            b[64..68].copy_from_slice(&mask.to_le_bytes());
+            b[88] = 0xFF;
+            for k in 1..16usize {
+                let o = 88 * k;
+                if o + 88 <= 1496 {
+                    b[o + 84] = 0xFF;
+                    b[o + 88] = 0xFF;
+                }
+            }
+            b
+        };
+        let report15 = |tag: &str, b: &[u8]| {
+            let st44 = u32::from_le_bytes(b[44..48].try_into().unwrap());
+            let echo_id = u32::from_le_bytes(b[48..52].try_into().unwrap());
+            let echo_cmd = u32::from_le_bytes(b[52..56].try_into().unwrap());
+            let echo_mask = u32::from_le_bytes(b[64..68].try_into().unwrap());
+            println!(
+                "  {tag}: guard st(+44)={st44} id(+48)={echo_id:#x}(want {idv:#x}) cmd(+52)={echo_cmd:#x} mask(+64)={echo_mask:#x}"
+            );
+            if st44 == 1 && echo_cmd == 0x2080_B26C {
+                // payload @+56 = C(1440B)：逐 armed 槽解析
+                let cmask = echo_mask;
+                for i in 0..16usize {
+                    if cmask & (1 << i) == 0 {
+                        continue;
+                    }
+                    let e = 88 * i + 32;
+                    if e + 88 > 1440 {
+                        break;
+                    }
+                    let p = 56 + e;
+                    let id = b[p];
+                    let temp = u32::from_le_bytes(b[p + 4..p + 8].try_into().unwrap());
+                    let d12 = u32::from_le_bytes(b[p + 12..p + 16].try_into().unwrap());
+                    let flag = b[p + 84];
+                    let mid: Vec<String> = b[p + 16..p + 60]
+                        .chunks_exact(4)
+                        .enumerate()
+                        .filter(|&(_, w)| w != [0u8, 0, 0, 0])
+                        .map(|(k, w)| {
+                            format!(
+                                "d{}={:#010x}",
+                                4 + k,
+                                u32::from_le_bytes(w.try_into().unwrap())
+                            )
+                        })
+                        .collect();
+                    let blk: Vec<String> = b[p + 60..p + 84]
+                        .chunks_exact(4)
+                        .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                        .collect();
+                    println!(
+                        "  C slot{i}: id={id} temp={:.2}C d12={d12:#x} remove_tdp={} mid=[{}] ctrl=[{}]",
+                        q8c(temp),
+                        flag == 1,
+                        mid.join(" "),
+                        blk.join(" ")
+                    );
+                }
+            }
+        };
+        for &xport in &[0x0700002Fu32, 0x07000191u32] {
+            let Some(f) = resolve14(xport) else {
+                println!("  transport {xport:#x}: QueryInterface FAILED");
+                continue;
+            };
+            for &mask in &[1u32, 0x5u32] {
+                let mut b = build15(mask);
+                let st = unsafe { f(handle, b.as_mut_ptr().cast(), 1496) } as i32;
+                println!("  transport {xport:#x} mask={mask:#x}: st={st}");
+                if st == 0 {
+                    report15(&format!("  resp {xport:#x}"), &b);
+                }
+            }
+        }
+
+        // ---- T16: 锚内模式派生 C 的真传输（sub_14028E600/sub_140277150 完整复刻）----
+        // C 传输 fn = TARGET GET-prime(0xC4554575) 解析地址 + off1，off1 从锚函数
+        // 内部六个唯一字节模式的排序约束 + 两条 rel32 引用解出：
+        //   off1 = p24 + rel32@(锚+p24+36) + 40；off2 = p31 + rel32@(锚+p31+12) + 16
+        //   （p31 == p24+40；序言校验 48 85 D2 0F 84…在派生2 = 锚+off2 上做）。
+        // 模式 = 621 世代 nvapi64 构建指纹（mVolt 0.50.13 同款）。
+        println!("=== [T16] derive C transport from TARGET anchor (pattern set) ===");
+        let anchor = resolve14(0xC4554575).map_or(0usize, |f| unsafe {
+            core::mem::transmute::<
+                unsafe extern "C" fn(
+                    nvapi::sys::handles::NvPhysicalGpuHandle,
+                    *mut core::ffi::c_void,
+                    usize,
+                ) -> nvapi::sys::NvAPI_Status,
+                usize,
+            >(f)
+        });
+        if anchor == 0 {
+            println!("  anchor QueryInterface FAILED");
+        } else {
+            println!("  anchor fn @ {anchor:#x}");
+            const PAT1: [u8; 6] = [0x48, 0x8B, 0xFA, 0x4C, 0x8B, 0xF9];
+            const PAT2: [u8; 20] = [
+                0x45, 0x89, 0x7E, 0x30, 0x41, 0xC7, 0x46, 0x34, 0x2C, 0x85, 0x80, 0x20, 0x41, 0x8B,
+                0x45, 0x04, 0x41, 0x89, 0x46, 0x40,
+            ];
+            const PAT3: [u8; 23] = [
+                0xC7, 0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x28, 0x00, 0xC6,
+                0x44, 0x24, 0x20, 0x00, 0x45, 0x33, 0xC9, 0x41, 0xB8,
+            ];
+            const PAT4: [u8; 12] = [
+                0x89, 0x45, 0x00, 0x48, 0x8D, 0x55, 0x00, 0x41, 0x8B, 0x4E, 0x2C, 0xE8,
+            ];
+            const PAT5: [u8; 30] = [
+                0x41, 0x0F, 0xB6, 0xCF, 0x48, 0x6B, 0xF9, 0x58, 0x49, 0x03, 0xFE, 0x48, 0x6B, 0xD9,
+                0x3C, 0x49, 0x03, 0xDD, 0x8B, 0x47, 0x5C, 0x89, 0x43, 0x1C, 0x8B, 0x47, 0x64, 0x89,
+                0x43, 0x20,
+            ];
+            const PAT6: [u8; 20] = [
+                0x38, 0x8F, 0xAC, 0x00, 0x00, 0x00, 0x0F, 0x94, 0xC1, 0x0F, 0xB6, 0x43, 0x4C, 0x24,
+                0xFE, 0x0A, 0xC8, 0x88, 0x4B, 0x4C,
+            ];
+            const PAT7: [u8; 45] = [
+                0x8B, 0x87, 0x98, 0x00, 0x00, 0x00, 0x89, 0x43, 0x38, 0x8B, 0x87, 0x9C, 0x00, 0x00,
+                0x00, 0x89, 0x43, 0x3C, 0x8B, 0x87, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x43, 0x40, 0x8B,
+                0x87, 0xA4, 0x00, 0x00, 0x00, 0x89, 0x43, 0x44, 0x8B, 0x87, 0xA8, 0x00, 0x00, 0x00,
+                0x89, 0x43, 0x48,
+            ];
+            let find_unique = |hay: &[u8], needle: &[u8]| -> Option<usize> {
+                let first = hay.windows(needle.len()).position(|w| w == needle)?;
+                let rest = &hay[first + 1..];
+                if rest.windows(needle.len()).any(|w| w == needle) {
+                    return None; // 非唯一
+                }
+                Some(first)
+            };
+            let window = unsafe { std::slice::from_raw_parts(anchor as *const u8, 0x4000) };
+            let r = (|| -> Option<(usize, usize, i32)> {
+                let p10 = find_unique(window, &PAT1)?;
+                let p17 = find_unique(window, &PAT2)?;
+                let p24 = find_unique(window, &PAT3)?;
+                let p31 = find_unique(window, &PAT4)?;
+                let p38 = find_unique(window, &PAT5)?;
+                let p44 = find_unique(window, &PAT6)?;
+                if !(p10 < p17 && p17 < p24) {
+                    return None;
+                }
+                if p31 != p24 + 40 || !(p31 < p38 && p38 < p44) {
+                    return None;
+                }
+                if p31 + 16 > window.len() - 256 {
+                    return None;
+                }
+                let v47 = u32::from_le_bytes(window[p24 + 23..p24 + 27].try_into().unwrap());
+                let q27 = u64::from_le_bytes(window[p24 + 27..p24 + 35].try_into().unwrap());
+                if q27 != 0x0700_18FB_9D68_B49 || window[p24 + 35] != 0xE8 {
+                    return None;
+                }
+                if (v47.wrapping_sub(1)) > 0xFFFFF {
+                    return None;
+                }
+                let p53 = find_unique(window, &PAT7)?;
+                if p53 + PAT7.len() != p44 {
+                    return None;
+                }
+                let rel1 = i32::from_le_bytes(window[p24 + 36..p24 + 40].try_into().unwrap());
+                let rel2 = i32::from_le_bytes(window[p31 + 12..p31 + 16].try_into().unwrap());
+                Some((
+                    p24 + rel1 as usize + 40,
+                    p31 + rel2 as usize + 16,
+                    v47 as i32,
+                ))
+            })();
+            match r {
+                Some((off1, off2, v47)) => {
+                    println!(
+                        "  derived: off1={off1:#x} off2={off2:#x} v47={v47} -> transport @ {:#x}",
+                        anchor + off1
+                    );
+                    // 派生2 的序言校验（48 85 D2 0F 84 / 83 3A 00 0F 85 / 32 C0 C3）
+                    let d2 =
+                        unsafe { std::slice::from_raw_parts((anchor + off2) as *const u8, 24) };
+                    let d0 = u32::from_le_bytes(d2[0..4].try_into().unwrap());
+                    let d9 = u32::from_le_bytes(d2[9..13].try_into().unwrap());
+                    let r5 = i32::from_le_bytes(d2[5..9].try_into().unwrap());
+                    let r14 = i32::from_le_bytes(d2[14..18].try_into().unwrap());
+                    let t = (r5 + 9) as usize;
+                    let sig_ok = d0 == 0x0FD2_8548
+                        && d2[4] == 0x84
+                        && d9 == 0x0F00_3A83
+                        && d2[13] == 0x85
+                        && (r5 - 9) as u64 <= 0xFEE
+                        && r5 + 9 == r14 + 18
+                        && d2[t] == 0x32
+                        && d2[t + 1] == 0xC0
+                        && d2[t + 2] == 0xC3;
+                    println!("  derived2 prologue check: {sig_ok}");
+                    let transport: unsafe extern "system" fn(
+                        u32,
+                        *mut u8,
+                        u32,
+                        usize,
+                        u8,
+                        u8,
+                        usize,
+                    ) -> u32 = unsafe { core::mem::transmute(anchor + off1) };
+                    for &mask in &[1u32, 0x5u32] {
+                        let mut b = build15(mask);
+                        let st =
+                            unsafe { transport(0x0700_002F, b.as_mut_ptr(), 1496, 0, 0, 0, 0) };
+                        println!("  C transport mask={mask:#x}: st={st:#x}");
+                        if st == 0 {
+                            report15("  C resp", &b);
+                        }
+                    }
+                }
+                None => println!(
+                    "  pattern set did not match this nvapi64 build (fingerprint is generation-specific — mVolt 0.50.13 targets 621.x)"
+                ),
+            }
+        }
     }
 
     // ---- ⑥T9-end 复读：夹住整个运行期的面板操作（无需卡 15s 轮询点）----
