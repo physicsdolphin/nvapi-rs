@@ -149,6 +149,7 @@ fn power_control_lane_probe() {
 
     // ---- C2. class2 全 32 通道扫描（identity 23 定位）----
     println!("\n[C2] class2 full 32-channel sweep (identity map):");
+    let deep = std::env::var("NVOC_POWER_CONTROL_DEEP").is_ok();
     for ch in 0..32usize {
         if class2_channels.iter().any(|(c, _, _)| *c == ch) {
             continue;
@@ -159,6 +160,21 @@ fn power_control_lane_probe() {
                 let identity = u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
                 let request = u32::from_le_bytes(buf[base + 68..base + 72].try_into().unwrap());
                 println!("    ch{ch}: identity={identity}, request={request} (0x{request:X})");
+                if deep {
+                    // 深挖：非零 dword 全量（min/max/单位语义定位）
+                    let nz: Vec<(usize, u32)> = (0..160)
+                        .map(|i| {
+                            (
+                                i * 4,
+                                u32::from_le_bytes(
+                                    buf[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
+                                ),
+                            )
+                        })
+                        .filter(|&(_, v)| v != 0 && v != u32::MAX)
+                        .collect();
+                    println!("      ch{ch} nonzero dwords: {nz:?}");
+                }
                 class2_channels.push((ch, identity, request));
             }
             Err(_) => {}
