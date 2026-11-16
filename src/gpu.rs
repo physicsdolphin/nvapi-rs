@@ -241,6 +241,34 @@ pub const POWER_CONTROL_CLASS2: PowerControlGeometry = PowerControlGeometry {
     info_buf_len: 0x0005_4BF4,
 };
 
+/// CONTROL 大包一行（[`PhysicalGpu::power_control_rows`] 扫描结果）。
+/// identity 语义（2026-11-16 Turing 写实证，2070/621.24）：**0 = board-power
+/// request（mW；ch2 写 175000 → 功耗墙 175W）**；**23 = NVVDD OCP request
+/// （mA；Blackwell 面，mVolt 5060 Ti 写 9999A 即此行）**；其余 identity
+/// （3/4/6/11…）为驱动镜像行——SET 拒 -1（行身份规则，mVolt kind-27 校验
+/// 同款约束）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PowerControlRow {
+    pub channel: usize,
+    pub identity: u32,
+    pub request: u32,
+    /// SET 合法集 {0, 23}。
+    pub writable: bool,
+}
+
+impl PowerControlRow {
+    /// 行单位语义：identity-0 = 板载功耗 request（mW），identity-23 = NVVDD
+    /// OCP request（mA）。
+    pub fn unit(&self) -> Option<&'static str> {
+        match self.identity {
+            0 => Some("mW"),
+            23 => Some("mA"),
+            _ => None,
+        }
+    }
+}
+
 /// P0 core-domain voltage bounds derived from a type-1 status entry
 /// (semantics confirmed on RTX 4060 Laptop / 610.74 and desktop 20/30-series —
 /// see `sys::gpu::power::undocumented::status_values` for the per-index table).
@@ -3772,6 +3800,104 @@ impl PhysicalGpu {
         crate::status_result(sys::Api::NvAPI_GPU_ClientTgpWattSetStatus, status)
             .map_err(crate::Error::from)?;
         Ok(())
+    }
+
+    /// CONTROL 大包类探测（mVolt sub_140251EE0 语义完整复刻）：class1 INFO
+    /// 先行，-9（IncompatibleStructVersion）降级 class2，其余错误/双失败 =
+    /// None（车道不适用）。2070/621.24 实测双 class INFO 均通，mVolt 语义
+    /// 取 class1。
+    pub fn power_control_geometry(&self) -> Option<&'static PowerControlGeometry> {
+        match self.power_info_table_probe(&POWER_CONTROL_CLASS1) {
+            Ok(_) => Some(&POWER_CONTROL_CLASS1),
+            Err(e) => {
+                if e.nvapi_status() == Some(sys::Status::IncompatibleStructVersion) {
+                    self.power_info_table_probe(&POWER_CONTROL_CLASS2)
+                        .ok()
+                        .map(|_| &POWER_CONTROL_CLASS2)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// 全槽位扫描：0..mask_dwords×32 逐通道 GET，驱动拒（-1）的通道跳过。
+    /// Turing class1 mask 表 256 通道（populated ⊂ 0..32，其余 -1 秒拒）；
+    /// class2 = 32 通道全扫。
+    pub fn power_control_rows(
+        &self,
+        geometry: &PowerControlGeometry,
+    ) -> crate::Result<Vec<PowerControlRow>> {
+        let mut rows = Vec::new();
+        for ch in 0..geometry.mask_dwords * 32 {
+            if let Ok(buf) = self.power_control_table(geometry, ch) {
+                let base = geometry.entry_off + geometry.stride * ch;
+                let identity = u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
+                let request = u32::from_le_bytes(buf[base + 68..base + 72].try_into().unwrap());
+                rows.push(PowerControlRow {
+                    channel: ch,
+                    identity,
+                    request,
+                    writable: matches!(identity, 0 | 23),
+                });
+            }
+        }
+        Ok(rows)
+    }
+
+    /// 全配方写（mVolt RMW + 保留性判决同款）：identity ∈ {0,23} guard →
+    /// SET → 12×100ms 轮询连续 2 次一致 → 返回写前值；不保留自动还原原值
+    /// 并报 [`crate::Error::RetainMismatch`]。**DANGEROUS protection-limit
+    /// 面**——identity-0 = 板载功耗 request（mW，2070 实证 175000 → 功耗墙
+    /// 175W），identity-23 = NVVDD OCP request（mA）。返回 (previous,
+    /// identity)。
+    pub fn set_power_control_row_checked(
+        &self,
+        geometry: &PowerControlGeometry,
+        channel: usize,
+        value: u32,
+    ) -> crate::Result<(u32, u32)> {
+        let mut buf = self.power_control_table(geometry, channel)?;
+        let base = geometry.entry_off + geometry.stride * channel;
+        let identity = u32::from_le_bytes(buf[base..base + 4].try_into().unwrap());
+        if !matches!(identity, 0 | 23) {
+            // the offending value carries the row identity: "received value 6
+            // out of range" = an identity-6 (driver mirror) row, matching the
+            // live SET -1 refusal
+            return Err(crate::Error::ArgumentRange(
+                crate::sys::ArgumentRangeError::new(identity as i64),
+            ));
+        }
+        let before = u32::from_le_bytes(buf[base + 68..base + 72].try_into().unwrap());
+        buf[base + 68..base + 72].copy_from_slice(&value.to_ne_bytes());
+        {
+            use crate::sys::api::NvAPI_GPU_ClientTgpWattSetStatus;
+            let status = unsafe { NvAPI_GPU_ClientTgpWattSetStatus(self.0, buf.as_ptr().cast()) };
+            crate::status_result(sys::Api::NvAPI_GPU_ClientTgpWattSetStatus, status)
+                .map_err(crate::Error::from)?;
+        }
+        let mut streak = 0u32;
+        for _ in 0..12 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let rb = self.power_control_table(geometry, channel)?;
+            let v = u32::from_le_bytes(rb[base + 68..base + 72].try_into().unwrap());
+            if v == value {
+                streak += 1;
+                if streak >= 2 {
+                    return Ok((before, identity));
+                }
+            } else {
+                streak = 0;
+            }
+        }
+        if value != before {
+            let _ = self.set_power_control_entry(geometry, channel, before);
+        }
+        Err(crate::Error::RetainMismatch {
+            what: "power-control row request",
+            wrote: value as i32,
+            retained: before as i32,
+        })
     }
 
     /// Read a power-command channel value (NDA 0x33AB0353 GET; xOCD 2.0

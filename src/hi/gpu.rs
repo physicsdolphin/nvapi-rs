@@ -711,6 +711,32 @@ impl Gpu {
         self.gpu.reset_tgp_watt(policy_index)
     }
 
+    /// CONTROL big-packet lane class detection (mVolt INFO-probe semantics:
+    /// class1 first, -9 → class2). `None` = lane unavailable.
+    pub fn power_control_geometry(&self) -> Option<&'static crate::PowerControlGeometry> {
+        self.gpu.power_control_geometry()
+    }
+
+    /// Full CONTROL row sweep for the given class geometry.
+    pub fn power_control_rows(
+        &self,
+        geometry: &crate::PowerControlGeometry,
+    ) -> crate::Result<Vec<crate::PowerControlRow>> {
+        self.gpu.power_control_rows(geometry)
+    }
+
+    /// Checked CONTROL row write (identity {0,23} guard + mVolt retention
+    /// recipe). Returns (previous, identity).
+    pub fn set_power_control_row_checked(
+        &self,
+        geometry: &crate::PowerControlGeometry,
+        channel: usize,
+        value: u32,
+    ) -> crate::Result<(u32, u32)> {
+        self.gpu
+            .set_power_control_row_checked(geometry, channel, value)
+    }
+
     /// D-Notifier current state + the D1..D5 power-cap table (NDA 0x67F31384,
     /// the same private ClientPowerPoliciesGetInfo used by `tgp_watt_range`).
     /// `Ok(None)` where the driver doesn't expose the private interface.
