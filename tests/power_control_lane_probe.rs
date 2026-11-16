@@ -235,7 +235,8 @@ fn power_control_lane_probe() {
         }
     }
 
-    // ---- 写臂（默认关） ----
+    // ---- 写臂（默认关）。合法目标 = identity ∈ {0, 23} 行（mVolt kind-27
+    // 校验同款约束；identity-6 等其他行驱动 SET 拒 -1，2070 实证）。 ----
     let write_mode = std::env::var("NVOC_POWER_CONTROL_WRITE").ok();
     if let Some(mode) = write_mode {
         println!("\n[WRITE] NVOC_POWER_CONTROL_WRITE={mode} —— 写臂启用");
@@ -243,44 +244,61 @@ fn power_control_lane_probe() {
         let ch: usize = std::env::var("NVOC_POWER_CONTROL_WRITE_CH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                // 自动选行：identity-0 优先，其次 23（class2 扫描结果）
+                match zero_row {
+                    Some(&(c, _, _)) => c,
+                    None => ocp_row.map(|&(c, _, _)| c).unwrap_or(0),
+                }
+            });
+        let force = std::env::var("NVOC_POWER_CONTROL_FORCE").is_ok();
         let cur = gpu.power_control_table(geom, ch).expect("pre-write GET");
         let base = geom.entry_off + geom.stride * ch;
-        let before = u32::from_le_bytes(cur[base + 68..base + 72].try_into().unwrap());
-        let target = if mode == "echo" {
-            println!("    echo 模式：entry+68 原值 {before} 回写（零改动验证）");
-            before
+        let identity = u32::from_le_bytes(cur[base..base + 4].try_into().unwrap());
+        if !matches!(identity, 0 | 23) && !force {
+            println!(
+                "    ABORT: ch{ch} identity={identity} 不在合法集 {{0,23}}（驱动 SET 拒 -1）。\
+                 合法通道见 [C]/[C2] 扫描；确要试请加 NVOC_POWER_CONTROL_FORCE=1"
+            );
         } else {
-            let v = mode.parse::<u32>().expect("NVOC_POWER_CONTROL_WRITE=<u32>");
-            println!("    真写：entry+68 {before} → {v}");
-            v
-        };
-        gpu.set_power_control_entry(geom, ch, target).expect("SET");
-        // mVolt 12×100ms 轮询，连续 2 次一致判保留
-        let mut streak = 0;
-        let mut retained = None;
-        for _ in 0..12 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let rb = gpu.power_control_table(geom, ch).expect("readback GET");
-            let v = u32::from_le_bytes(rb[base + 68..base + 72].try_into().unwrap());
-            if v == target {
-                streak += 1;
-                if streak == 2 {
-                    retained = Some(v);
-                    break;
-                }
+            let before = u32::from_le_bytes(cur[base + 68..base + 72].try_into().unwrap());
+            let target = if mode == "echo" {
+                println!(
+                    "    echo 模式：ch{ch}(identity {identity}) entry+68 原值 {before} 回写（零改动验证）"
+                );
+                before
             } else {
-                streak = 0;
+                let v = mode.parse::<u32>().expect("NVOC_POWER_CONTROL_WRITE=<u32>");
+                println!("    真写：ch{ch}(identity {identity}) entry+68 {before} → {v}");
+                v
+            };
+            gpu.set_power_control_entry(geom, ch, target).expect("SET");
+            // mVolt 12×100ms 轮询，连续 2 次一致判保留
+            let mut streak = 0;
+            let mut retained = None;
+            for _ in 0..12 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let rb = gpu.power_control_table(geom, ch).expect("readback GET");
+                let v = u32::from_le_bytes(rb[base + 68..base + 72].try_into().unwrap());
+                if v == target {
+                    streak += 1;
+                    if streak == 2 {
+                        retained = Some(v);
+                        break;
+                    }
+                } else {
+                    streak = 0;
+                }
             }
-        }
-        match retained {
-            Some(v) => println!("    RETAINED: entry+68 = {v}（连续 2 次读回一致）"),
-            None => {
-                println!("    NOT RETAINED —— 驱动未保留该写值");
-                if target != before {
-                    println!("    还原 {before}…");
-                    gpu.set_power_control_entry(geom, ch, before)
-                        .expect("restore SET");
+            match retained {
+                Some(v) => println!("    RETAINED: entry+68 = {v}（连续 2 次读回一致）"),
+                None => {
+                    println!("    NOT RETAINED —— 驱动未保留该写值");
+                    if target != before {
+                        println!("    还原 {before}…");
+                        gpu.set_power_control_entry(geom, ch, before)
+                            .expect("restore SET");
+                    }
                 }
             }
         }
