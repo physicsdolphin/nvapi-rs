@@ -184,6 +184,63 @@ pub struct VoltRails {
     pub rail_descriptors: Vec<RailDescriptor>,
 }
 
+/// mVolt+ 0.50.13 引擎二 Board-power CONTROL 大包几何（2026-11-16 调用链
+/// 回溯 → docs/reverse-engineering/nvapi/mvolt-ocp-control-lane.md）。同一
+/// 对 ID（0x8B3E7343 GET / 0xAFFC2279 SET）已知三种 stamp 形态里的第三种：
+/// 描述符驱动的大 CONTROL 表——entry 0x2448 B 巨槽、request 写点 entry+68、
+/// 通道 identity ∈ {0, 23}（entry+0）。class 1 = mVolt 描述符
+/// unk_140374B60（Turing/pre-Blackwell 域；pre-Ampere 上 compact
+/// 0x0001_0A4C SET 会 fault 驱动（nvlddmkm 14/153，set-pwr-cur-limit 事故），
+/// mVolt 在 2070 实测成功写 OCP 走的就是 class-1 形态——探针终审 pending）；
+/// class 2 = unk_140374AD0（Blackwell 域）。字段名 = 描述符内偏移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerControlGeometry {
+    /// mVolt class id（desc+0；1 = Turing 域 / 2 = Blackwell 域）。
+    pub class: u8,
+    /// packet 头 stamp（desc+48）。
+    pub stamp: u32,
+    /// packet 缓冲长度（desc+56；mVolt 按此分配，GET/SET 同长）。
+    pub buf_len: usize,
+    /// 通道掩码 dword 偏移（desc+64）。
+    pub mask_off: usize,
+    /// entry 区偏移（desc+72）。
+    pub entry_off: usize,
+    /// entry stride（desc+80；两代同为 0x2448 = 9288 B）。
+    pub stride: usize,
+    /// 掩码 dword 数（desc+4；class1 = 8 → 256 通道，class2 = 1 → 32 通道）。
+    pub mask_dwords: usize,
+    /// 同 class INFO 表 stamp（desc+8；0x67F31384 类探测用）。
+    pub info_stamp: u32,
+    /// 同 class INFO 表缓冲长度（desc+16）。
+    pub info_buf_len: usize,
+}
+
+/// class 1 大包几何（mVolt unk_140374B60；值 = 描述符原始字段）。
+pub const POWER_CONTROL_CLASS1: PowerControlGeometry = PowerControlGeometry {
+    class: 1,
+    stamp: 0x0027_86E0,
+    buf_len: 0x0024_86E0, // 2,393,824 B
+    mask_off: 0x88,
+    entry_off: 0xA68,
+    stride: 0x2448,
+    mask_dwords: 8,
+    info_stamp: 0x002B_A030,
+    info_buf_len: 0x002B_A030,
+};
+
+/// class 2 大包几何（mVolt unk_140374AD0；值 = 描述符原始字段）。
+pub const POWER_CONTROL_CLASS2: PowerControlGeometry = PowerControlGeometry {
+    class: 2,
+    stamp: 0x0005_B0B0,
+    buf_len: 0x0004_B0B0, // 307,376 B
+    mask_off: 0x88,
+    entry_off: 0xA30,
+    stride: 0x2448,
+    mask_dwords: 1,
+    info_stamp: 0x000F_4BF4,
+    info_buf_len: 0x0005_4BF4,
+};
+
 /// P0 core-domain voltage bounds derived from a type-1 status entry
 /// (semantics confirmed on RTX 4060 Laptop / 610.74 and desktop 20/30-series —
 /// see `sys::gpu::power::undocumented::status_values` for the per-index table).
@@ -2936,12 +2993,13 @@ impl PhysicalGpu {
             NvAPI_GPU_ClockClkPropTopRelsGetInfo(self.0, ptr::from_mut(&mut info).cast())
         };
         crate::status_result(sys::Api::NvAPI_GPU_ClockClkPropTopRelsGetInfo, st)?;
-        Ok(info.relation_payload(idx).map(|p| p))
+        Ok(info.relation_payload(idx))
     }
 
     /// Enumerate the TopRels relation table (GetInfo): every populated
     /// relation with its index, (src, dst) domains, direction flag, and
     /// default payload (the relation's initial ratio when it carries one).
+    #[allow(clippy::type_complexity)]
     pub fn top_rels_relations(&self) -> crate::Result<Vec<(usize, u32, u32, u32, u32)>> {
         use crate::sys::api::NvAPI_GPU_ClockClkPropTopRelsGetInfo;
         use clock::undocumented::{NV_GPU_CLOCK_CLIENT_CLK_PROP_TOP_RELS_INFO, clk_top_rels_info};
@@ -3575,6 +3633,145 @@ impl PhysicalGpu {
     fn power_command_packet_ok(channel: u8, command: u32) -> bool {
         use power::undocumented::NV_GPU_POWER_COMMAND_PACKET_V1 as Pkt;
         channel as usize <= Pkt::MAX_CHANNEL && matches!(command, Pkt::COMMAND_F8 | Pkt::COMMAND_FE)
+    }
+
+    // ------------------------------------------------------------------
+    // PwrPolicies v3|3240 packet（mVolt+ 0.50.13 引擎二同款）。
+    // 81 通道×40B 槽 + stamp 0x0003_0CA8。
+    // 勘误（2026-11-16 调用链回溯）：上一轮「Turing v3 GET 全 -9」探的是
+    // 0x33AB0353（引擎级 policies 接口，v1|1320 的读回半边），不是 mVolt
+    // A670 大表回读的真接口 0xC12EB19E（host+24 槽，blob 解码确认）。本函数
+    // 保留作对照实验；真接口封装见 power_readback_table_v3()。
+    // ------------------------------------------------------------------
+
+    /// v3 packet stamp `(3 << 16) | 3240`。
+    pub const POWER_POLICIES_V3_STAMP: u32 = 0x0003_0CA8;
+    /// v3 packet 总字节数。
+    pub const POWER_POLICIES_V3_SIZE: usize = 3240;
+    /// v3 通道槽 stride。
+    pub const POWER_POLICIES_V3_STRIDE: usize = 40;
+
+    /// GET the full v3|3240 PwrPolicies table via NDA 0x33AB0353（对照实验
+    /// 形态——mVolt 真用的是 [`Self::power_readback_table_v3`]）. Read-only:
+    /// sends stamp + zero payload and returns the raw 3240-byte table.
+    pub fn power_policies_table_v3(&self) -> crate::Result<Vec<u8>> {
+        use crate::sys::api::NvAPI_GPU_ClientPwrPoliciesGetControl;
+        let mut buf = vec![0u8; Self::POWER_POLICIES_V3_SIZE];
+        buf[..4].copy_from_slice(&Self::POWER_POLICIES_V3_STAMP.to_ne_bytes());
+        let status =
+            unsafe { NvAPI_GPU_ClientPwrPoliciesGetControl(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientPwrPoliciesGetControl, status)
+            .map_err(crate::Error::from)?;
+        Ok(buf)
+    }
+
+    /// SET a dword into the v3|3240 PwrPolicies table at `offset` (NDA
+    /// 0x17695269). Read-modify-write of the full table. DANGEROUS: the
+    /// driver consumes the table at its next policy evaluation.
+    pub fn set_power_policies_table_v3(&self, offset: usize, value: u32) -> crate::Result<()> {
+        use crate::sys::api::{
+            NvAPI_GPU_ClientPwrPoliciesGetControl, NvAPI_GPU_ClientPwrPoliciesSetControl,
+        };
+        let mut buf = vec![0u8; Self::POWER_POLICIES_V3_SIZE];
+        buf[..4].copy_from_slice(&Self::POWER_POLICIES_V3_STAMP.to_ne_bytes());
+        let status =
+            unsafe { NvAPI_GPU_ClientPwrPoliciesGetControl(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientPwrPoliciesGetControl, status)
+            .map_err(crate::Error::from)?;
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| crate::Error::ArgumentRange(Default::default()))?;
+        if end > buf.len() {
+            return Err(crate::Error::ArgumentRange(Default::default()));
+        }
+        buf[offset..end].copy_from_slice(&value.to_le_bytes());
+        let status = unsafe { NvAPI_GPU_ClientPwrPoliciesSetControl(self.0, buf.as_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientPwrPoliciesSetControl, status)
+            .map_err(crate::Error::from)?;
+        Ok(())
+    }
+
+    /// 大表回读 GET via NDA 0xC12EB19E（`NvAPI_GPU_PowerMonitorGetInfo`，
+    /// mVolt 引擎二 host+24 槽 / mini blob E）——mVolt sub_14026A670 的
+    /// v3|3240(199848) 大表回读形态。这是「Turing 上 v3 表是否可用」的
+    /// 终审对象（上一轮 -9 判决探错了接口）。Read-only。
+    pub fn power_readback_table_v3(&self) -> crate::Result<Vec<u8>> {
+        use crate::sys::api::NvAPI_GPU_PowerMonitorGetInfo;
+        let mut buf = vec![0u8; Self::POWER_POLICIES_V3_SIZE];
+        buf[..4].copy_from_slice(&Self::POWER_POLICIES_V3_STAMP.to_ne_bytes());
+        let status = unsafe { NvAPI_GPU_PowerMonitorGetInfo(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_PowerMonitorGetInfo, status)
+            .map_err(crate::Error::from)?;
+        Ok(buf)
+    }
+
+    /// INFO 表类探测（mVolt sub_140251EE0 同款）via NDA 0x67F31384
+    /// （`NvAPI_GPU_ClientPowerPoliciesGetInfoPrivate`，引擎二 host+16 槽）。
+    /// 把 `geometry.info_stamp` 前置进零缓冲 GET；返回 `Err(Nvapi)` 时调用
+    /// 方比对 [`sys::Status::IncompatibleStructVersion`]（-9）——mVolt 的
+    /// class 1→2 自动降级信号。其余错误 = 硬失败。
+    pub fn power_info_table_probe(
+        &self,
+        geometry: &PowerControlGeometry,
+    ) -> crate::Result<Vec<u8>> {
+        use crate::sys::api::NvAPI_GPU_ClientPowerPoliciesGetInfoPrivate;
+        let mut buf = vec![0u8; geometry.info_buf_len];
+        buf[..4].copy_from_slice(&geometry.info_stamp.to_ne_bytes());
+        let status =
+            unsafe { NvAPI_GPU_ClientPowerPoliciesGetInfoPrivate(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(
+            sys::Api::NvAPI_GPU_ClientPowerPoliciesGetInfoPrivate,
+            status,
+        )
+        .map_err(crate::Error::from)?;
+        Ok(buf)
+    }
+
+    /// CONTROL 大包 GET via NDA 0x8B3E7343
+    /// （`NvAPI_GPU_ClientTgpWattGetStatus` 同 ID 异 stamp）。mVolt
+    /// sub_14026A340 同款：stamp 前置 + 单通道掩码置位（`1 << channel % 32`
+    /// 落在 `channel / 32` 号掩码 dword）+ entry 头 request = 0xFFFFFFFF。
+    /// 返回原始 `geometry.buf_len` 字节缓冲（entry 区自
+    /// `geometry.entry_off` 起、stride `geometry.stride`）。
+    pub fn power_control_table(
+        &self,
+        geometry: &PowerControlGeometry,
+        channel: usize,
+    ) -> crate::Result<Vec<u8>> {
+        use crate::sys::api::NvAPI_GPU_ClientTgpWattGetStatus;
+        let mut buf = vec![0u8; geometry.buf_len];
+        buf[..4].copy_from_slice(&geometry.stamp.to_ne_bytes());
+        let mask_pos = geometry.mask_off + 4 * (channel / 32);
+        buf[mask_pos..mask_pos + 4].copy_from_slice(&(1u32 << (channel % 32)).to_ne_bytes());
+        let entry = geometry.entry_off + geometry.stride * channel;
+        buf[entry..entry + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let status = unsafe { NvAPI_GPU_ClientTgpWattGetStatus(self.0, buf.as_mut_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientTgpWattGetStatus, status)
+            .map_err(crate::Error::from)?;
+        Ok(buf)
+    }
+
+    /// CONTROL 大包 SET via NDA 0xAFFC2279
+    /// （`NvAPI_GPU_ClientTgpWattSetStatus` 同 ID 异 stamp）。RMW：先
+    /// [`Self::power_control_table`] 取快照，patch `entry + 68`（mVolt
+    /// request 写点）为新值，写。**DANGEROUS protection-limit 面**——
+    /// identity ∈ {0, 23} 两通道即 board-power / OCP request；越 [min,max]
+    /// 边界与恢复语义由调用方自管（mVolt 用 12×100ms 轮询读回，本封装
+    /// 只做单发，轮询在探针/CLI 层）。
+    pub fn set_power_control_entry(
+        &self,
+        geometry: &PowerControlGeometry,
+        channel: usize,
+        value: u32,
+    ) -> crate::Result<()> {
+        use crate::sys::api::NvAPI_GPU_ClientTgpWattSetStatus;
+        let mut buf = self.power_control_table(geometry, channel)?;
+        let entry = geometry.entry_off + geometry.stride * channel + 68;
+        buf[entry..entry + 4].copy_from_slice(&value.to_ne_bytes());
+        let status = unsafe { NvAPI_GPU_ClientTgpWattSetStatus(self.0, buf.as_ptr().cast()) };
+        crate::status_result(sys::Api::NvAPI_GPU_ClientTgpWattSetStatus, status)
+            .map_err(crate::Error::from)?;
+        Ok(())
     }
 
     /// Read a power-command channel value (NDA 0x33AB0353 GET; xOCD 2.0
@@ -7437,8 +7634,7 @@ impl PhysicalGpu {
         // mask@+8 as the touched-channel bitmap).
         let mut data = self
             .thermal_channel_control(0x3F)
-            .or_else(|_| self.thermal_channel_control(0x1cfff))
-            .map_err(crate::Error::from)?;
+            .or_else(|_| self.thermal_channel_control(0x1cfff))?;
         // Patch: applied@entry+4 + value@entry+8 (Q8). The T7-era empirical
         // 0x2F/0x65/0x80 byte writes were driver-side echoes, not request
         // fields — dropped with the T6d verdict.
@@ -7568,8 +7764,7 @@ impl PhysicalGpu {
         }
         let mut data = self
             .thermal_channel_control(0x3F)
-            .or_else(|_| self.thermal_channel_control(0x1cfff))
-            .map_err(crate::Error::from)?;
+            .or_else(|_| self.thermal_channel_control(0x1cfff))?;
         for ch in 0..6 {
             if mask & (1u32 << ch) != 0 {
                 data.entry[ch].applied = 0;
@@ -7829,7 +8024,7 @@ impl PhysicalGpu {
                 break;
             }
         }
-        targets.sort_by(|a, b| b.1.cmp(&a.1));
+        targets.sort_by_key(|t| std::cmp::Reverse(t.1));
         let Some(&(transport_addr, votes)) = targets.first() else {
             return Ok(None);
         };
@@ -7839,7 +8034,7 @@ impl PhysicalGpu {
         // Armed mask from PRIVATE INFO v4|15732 (accepted on 621.01/621.24);
         // fall back to slot 0 when unavailable.
         let mut mask = 1u32;
-        if let Some(f) = (|| {
+        let armed_info_fn = || {
             sys::nvapi_QueryInterface(0x2F69F8E5)
                 .ok()
                 .filter(|p| !p.is_null())
@@ -7853,7 +8048,8 @@ impl PhysicalGpu {
                         ) -> sys::NvAPI_Status,
                     >(p)
                 })
-        })() {
+        };
+        if let Some(f) = armed_info_fn() {
             let mut info = vec![0u8; 15732];
             info[0..4].copy_from_slice(&((4u32 << 16) | 15732).to_le_bytes());
             if unsafe { f(self.0, info.as_mut_ptr().cast(), 15732) } == 0 {

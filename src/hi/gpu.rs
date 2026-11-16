@@ -2028,6 +2028,7 @@ impl Gpu {
     }
 
     /// Enumerate the TopRels relation table (GetInfo).
+    #[allow(clippy::type_complexity)]
     pub fn top_rels_relations(&self) -> crate::Result<Vec<(usize, u32, u32, u32, u32)>> {
         self.gpu.top_rels_relations()
     }
